@@ -479,7 +479,8 @@ def main():
     scaler = GradScaler(enabled=args.fp16_precision)
 
     # Only rank 0 will run linear probing evals & print accuracy
-    stl10_eval = STL10Eval() if rank == 0 else None
+    stl10_eval = STL10Eval(image_size=image_size,
+                       dataset_path=args.dataset_path) if rank == 0 else None
 
     total_num_steps = (
         len(train_loader) * (args.num_epochs + 2)

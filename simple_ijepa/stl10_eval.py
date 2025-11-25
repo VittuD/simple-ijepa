@@ -1,10 +1,10 @@
+# simple_ijepa/stl10_eval.py
+
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision
 
-from sklearn.metrics import accuracy_score
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
@@ -38,11 +38,11 @@ class STL10Eval:
             "cuda" if torch.cuda.is_available() else "cpu")
 
         transform = inference_transforms(img_size=(image_size, image_size))
-        train_ds = torchvision.datasets.STL10("data/",
+        train_ds = torchvision.datasets.STL10(dataset_path,
                                               split='train',
                                               transform=transform,
                                               download=True)
-        val_ds = torchvision.datasets.STL10("data/",
+        val_ds = torchvision.datasets.STL10(dataset_path,
                                             split='test',
                                             transform=transform,
                                             download=True)

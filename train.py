@@ -74,7 +74,7 @@ def train_ijepa(args):
                                  weight_decay=args.weight_decay)
 
     stl10_ds = STL10(
-        "data/",
+        args.dataset_path,
         split="unlabeled",
         download=True,
         transform=training_transforms((image_size, image_size)),
@@ -95,7 +95,7 @@ def train_ijepa(args):
 
     scaler = GradScaler(enabled=args.fp16_precision)
 
-    stl10_eval = STL10Eval()
+    stl10_eval = STL10Eval(image_size=image_size, dataset_path=args.dataset_path)
     total_num_steps = (len(train_loader) *
                        (args.num_epochs + 2)) - args.update_gamma_after_step
     gamma = args.gamma
