@@ -55,22 +55,28 @@ class MaskedImageDataset(Dataset):
 
         target_indices_list = []
         all_target_indices = set()
+        context_set = set(context_indices)
+
         for _ in range(self.num_targets):
-            min_overlap = float('inf')
+            min_overlap = float("inf")
             best_target_indices = None
-            for _ in range(
-                    self.num_patches):  # Try up to num_patches iterations
-                target_indices = self.sample_block(num_patches_per_dim,
-                                                   scale_range=(0.15, 0.2),
-                                                   aspect_ratio_range=(0.75, 1.5))
-                overlap = len(set(context_indices) & set(target_indices)
-                              ) + len(all_target_indices & set(target_indices))
+
+            for _ in range(self.num_patches):  # Try up to num_patches iterations
+                candidate = self.sample_block(
+                    num_patches_per_dim,
+                    scale_range=(0.15, 0.2),
+                    aspect_ratio_range=(0.75, 1.5),
+                )
+                cand_set = set(candidate)
+
+                overlap = len(context_set & cand_set) + len(all_target_indices & cand_set)
                 if overlap == 0:
-                    best_target_indices = target_indices
+                    best_target_indices = candidate
                     break
                 if overlap < min_overlap:
                     min_overlap = overlap
-                    best_target_indices = target_indices
+                    best_target_indices = candidate
+
             target_indices_list.append(best_target_indices)
             all_target_indices.update(best_target_indices)
 
