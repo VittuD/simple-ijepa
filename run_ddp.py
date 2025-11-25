@@ -1,55 +1,44 @@
-# run_gated_training_ddp.py
-#
-# DDP training script for the *gated* I-JEPA variant (GatedIJEPA).
-# Each GPU runs one process, and the model internally decides which
-# tokens to keep as context and which to mask via hard-concrete gates.
-#
-# Observability:
-#   The model returns (loss, stats) where `stats` contains:
-#     - pred_loss
-#     - gate_penalty
-#     - open_prob_mean
-#     - closed_prob_mean
-#     - open_frac_per_sample
-#     - closed_frac_per_sample
-#     - gate_map_example
-#     - gate_values_full  (B, N) gate values for the whole batch
-#
-# Extra:
-#   On the first step of each epoch (step == 0, rank == 0), we save:
-#     - the batch images
-#     - a masked version where "closed" tokens are blacked out patch-wise.
-
 import argparse
 import os
 import random
 import numpy as np
 
-import torch.nn.functional as F
-
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 from torchvision.datasets import STL10
-from torchvision.utils import save_image  # NEW: for saving debug images
+from torchvision.utils import save_image
 
-from train import update_gamma  # reuse the same cosine EMA function
+from train import update_gamma
 
 from simple_ijepa.transformer import VisionTransformer
+from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.ijepa_gated import GatedIJEPA
 from simple_ijepa.stl10_eval import STL10Eval, logistic_regression
 from simple_ijepa.utils import training_transforms
+from simple_ijepa.dataset import MaskedImageDataset, collate_fn
+
 
 SEED = 42
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gated I-JEPA DDP")
+    parser = argparse.ArgumentParser(
+        description="I-JEPA DDP (baseline or gated variant)"
+    )
 
-    # same interface as run_training.py (mostly retro-compatible)
+    parser.add_argument(
+        "--variant",
+        default="baseline",
+        choices=["baseline", "gated"],
+        help="Which model variant to train: 'baseline' (IJEPA) or 'gated' (GatedIJEPA).",
+    )
+
+    # Common args (kept backward compatible with existing scripts)
     parser.add_argument(
         "--dataset_path",
         default="./data",
@@ -80,10 +69,16 @@ def parse_args():
         help="Per-process batch size (per GPU)",
     )
     parser.add_argument(
-        "-lr", "--learning_rate", default=3e-4, type=float
+        "-lr",
+        "--learning_rate",
+        default=3e-4,
+        type=float,
     )
     parser.add_argument(
-        "-wd", "--weight_decay", default=1e-5, type=float
+        "-wd",
+        "--weight_decay",
+        default=1e-5,
+        type=float,
     )
     parser.add_argument(
         "--fp16_precision",
@@ -127,7 +122,7 @@ def parse_args():
         help="Path to training_model.pth to resume training",
     )
 
-    # optional extras, backward compatible (only for DDP script)
+    # Dataloader workers (both variants)
     parser.add_argument(
         "--num_workers",
         default=8,
@@ -135,27 +130,25 @@ def parse_args():
         help="Number of dataloader workers per process",
     )
 
-    # gating-specific hyperparameters
+    # Gated-only knobs (ignored for baseline)
     parser.add_argument(
         "--lambda_gates",
         default=1e-3,
         type=float,
-        help="Weight for the gate penalty term.",
+        help="[gated] Weight for the gate penalty term.",
     )
     parser.add_argument(
         "--gate_exp_alpha",
         default=5.0,
         type=float,
-        help="Sharpness of exponential gate penalty as open fraction -> 1.",
+        help="[gated] Sharpness of exponential gate penalty as open fraction -> 1.",
     )
 
     return parser.parse_args()
 
 
 def setup_distributed():
-    """
-    Initialize the default process group using torchrun's env variables.
-    """
+    """Initialize the default process group using torchrun's env variables."""
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
 
@@ -176,6 +169,9 @@ def set_seed(seed, rank):
     torch.cuda.manual_seed_all(full_seed)
 
 
+# -----------------------------
+# Gated-specific utilities
+# -----------------------------
 def save_debug_masks(
     images: torch.Tensor,
     gate_values_full: torch.Tensor,
@@ -187,18 +183,8 @@ def save_debug_masks(
     max_images: int = 8,
 ):
     """
-    Save original and patch-masked versions of the first few images
-    in the batch, using the gate values to decide which patches to "mask".
-
-    Args:
-        images:          (B, C, H, W) on CUDA.
-        gate_values_full:(B, N) gate values in [0,1] on CUDA.
-        epoch:           current epoch index (0-based).
-        global_step:     global step counter (0-based).
-        save_root:       base directory for models/checkpoints.
-        image_size:      H = W for the images (e.g., 96).
-        patch_size:      patch side length in pixels (e.g., 8).
-        max_images:      number of images to visualize.
+    Save original and patch-masked versions of the first few images in the batch,
+    using the gate values to decide which patches to "mask".
     """
     os.makedirs(os.path.join(save_root, "debug_masks"), exist_ok=True)
     debug_dir = os.path.join(save_root, "debug_masks")
@@ -211,22 +197,19 @@ def save_debug_masks(
     W_p = image_size // patch_size
     N = H_p * W_p
 
-    # Ensure gate tensor is the right shape
     assert gate_values_full.shape[0] == B
     assert gate_values_full.shape[1] == N, "gate_values_full has wrong length."
 
-    # Move to CPU for saving
     images_cpu = images[:num_to_save].detach().cpu()
     gates_cpu = gate_values_full[:num_to_save].detach().cpu()  # (K, N)
 
     masked_images = []
 
-    # Threshold: gate < 0.5 => "closed" => overlay red cross on that patch
     for idx in range(num_to_save):
-        img = images_cpu[idx].clone()          # (C, H, W)
-        g = gates_cpu[idx]                     # (N,)
+        img = images_cpu[idx].clone()
+        g = gates_cpu[idx]
 
-        gate_map = g.view(H_p, W_p)            # (H_p, W_p)
+        gate_map = g.view(H_p, W_p)
 
         img_masked = img.clone()
 
@@ -238,29 +221,22 @@ def save_debug_masks(
                     w0 = pw * patch_size
                     w1 = w0 + patch_size
 
-                    # Option: zero the patch so content is fully hidden
                     img_masked[:, h0:h1, w0:w1] = 0.0
 
                     size = patch_size
                     diag = torch.arange(size)
 
-                    # main diagonal: (h0 + i, w0 + i)
                     img_masked[:, h0 + diag, w0 + diag] = 0.7
-
-                    # anti-diagonal: (h0 + i, w1 - 1 - i)
                     img_masked[:, h0 + diag, w1 - 1 - diag] = 0.7
 
         masked_images.append(img_masked)
 
-    masked_batch = torch.stack(masked_images, dim=0)  # (K, C, H, W)
+    masked_batch = torch.stack(masked_images, dim=0)
 
-
-    # Save grids
     step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
     orig_path = os.path.join(debug_dir, f"{step_str}_orig.png")
     masked_path = os.path.join(debug_dir, f"{step_str}_masked.png")
 
-    # Images are already in [0,1] from transforms.ToTensor()
     save_image(
         images_cpu,
         orig_path,
@@ -276,6 +252,7 @@ def save_debug_masks(
         value_range=(0.0, 1.0),
     )
 
+
 class GatedPredictorEncoder(torch.nn.Module):
     """
     Wraps a GatedIJEPA model to expose a plain encoder interface:
@@ -287,9 +264,6 @@ class GatedPredictorEncoder(torch.nn.Module):
 
     mode = "all_open":
         Uses the raw student tokens (no mask tokens), then runs the predictor.
-
-    These outputs can be fed into STL10Eval-style linear probing by
-    averaging over tokens.
     """
 
     def __init__(self, ijepa_model, mode: str = "gated"):
@@ -303,48 +277,40 @@ class GatedPredictorEncoder(torch.nn.Module):
         device = x.device
         m = self.ijepa
 
-        # 1) Student / context tokens
-        student_tokens = m.context_encoder(x)          # (B, N, D)
+        student_tokens = m.context_encoder(x)  # (B, N, D)
         B, N, D = student_tokens.shape
 
         if self.mode == "gated":
-            # 2) Learned gates
-            log_alpha = m.gate_mlp(student_tokens).squeeze(-1)   # (B, N)
-            gate_values, _ = m.gate(log_alpha, training=False)   # (B, N)
-            r = gate_values.unsqueeze(-1)                        # (B, N, 1)
+            log_alpha = m.gate_mlp(student_tokens).squeeze(-1)  # (B, N)
+            gate_values, _ = m.gate(log_alpha, training=False)  # (B, N)
+            r = gate_values.unsqueeze(-1)
 
-            # 3) Mix with mask token
-            mask_token = m.mask_token.to(device)                 # (1, D)
-            mask_tokens = mask_token.expand(B, N, D)             # (B, N, D)
+            mask_token = m.mask_token.to(device)
+            mask_tokens = mask_token.expand(B, N, D)
             one_minus_r = 1.0 - r
 
             context_tokens = r * student_tokens + one_minus_r * mask_tokens
         else:
-            # "all_open": no masking at all
             context_tokens = student_tokens
 
-        # 4) Predictor over tokens (no patchify, no extra pos emb)
         out = m.predictor(
             context_tokens,
             patchify=False,
             pos_embed=False,
         )
-        out = F.layer_norm(out, (out.size(-1),))                  # (B, N, D)
+        out = F.layer_norm(out, (out.size(-1),))
 
         return out
 
+
 @torch.inference_mode
 def get_image_embs_labels(encoder, dataloader, device):
-    """
-    Run encoder on STL-10 loader, average over tokens, return (embs, labels)
-    suitable for scikit-learn logistic regression.
-    """
     embs, labels = [], []
 
     for images, targets in dataloader:
         images = images.to(device)
-        out = encoder(images)                    # (B, N, D)
-        features = out.mean(dim=1)               # (B, D)
+        out = encoder(images)  # (B, N, D)
+        features = out.mean(dim=1)
 
         embs.extend(features.cpu().tolist())
         labels.extend(targets.cpu().tolist())
@@ -354,26 +320,16 @@ def get_image_embs_labels(encoder, dataloader, device):
 
 @torch.inference_mode
 def evaluate_gated_and_all_open(stl10_eval, ijepa_model):
-    """
-    Use STL10Eval's loaders, but evaluate linear probes on:
-
-      1) Predictor outputs with learned gates (mode="gated")
-      2) Predictor outputs with all gates open (mode="all_open")
-
-    This reuses the same logistic_regression function used by STL10Eval.
-    """
     device = stl10_eval.device
     train_loader = stl10_eval.train_loader
     val_loader = stl10_eval.val_loader
 
-    # --- Learned gates encoder ---
     gated_encoder = GatedPredictorEncoder(ijepa_model, mode="gated").to(device)
     print("Evaluating STL10 with predictor + learned gates...")
     emb_tr, lab_tr = get_image_embs_labels(gated_encoder, train_loader, device)
     emb_val, lab_val = get_image_embs_labels(gated_encoder, val_loader, device)
     logistic_regression(emb_tr, lab_tr, emb_val, lab_val)
 
-    # --- All-open encoder ---
     all_open_encoder = GatedPredictorEncoder(ijepa_model, mode="all_open").to(device)
     print("Evaluating STL10 with predictor + all gates open...")
     emb_tr2, lab_tr2 = get_image_embs_labels(all_open_encoder, train_loader, device)
@@ -389,16 +345,18 @@ def main():
 
     device = torch.device("cuda", local_rank)
 
-    # ----------------------------
-    # Model setup (similar to train.py)
-    # ----------------------------
+    # Shared model hyper-params
     dim = 512
     image_size = 96
     patch_size = 8
     depth = 6
     heads = 6
     mlp_dim = dim * 2
+    num_targets = 4
 
+    # ----------------------------
+    # Model setup
+    # ----------------------------
     encoder = VisionTransformer(
         image_size=image_size,
         patch_size=patch_size,
@@ -408,33 +366,61 @@ def main():
         mlp_dim=mlp_dim,
     )
 
-    model = GatedIJEPA(
-        encoder=encoder,
-        hidden_emb_dim=dim,
-        img_size=image_size,
-        patch_size=patch_size,
-        predictor_depth=6,
-        predictor_heads=6,
-        lambda_gates=args.lambda_gates,
-        gate_exp_alpha=args.gate_exp_alpha,
-    )
+    if args.variant == "baseline":
+        model = IJEPA(
+            encoder,
+            hidden_emb_dim=dim,
+            patch_size=patch_size,
+            num_targets=num_targets,
+        )
 
-    if args.ckpt_path is not None:
-        if rank == 0:
-            print(f"Loading checkpoint from {args.ckpt_path}")
-        map_location = {"cuda:0": f"cuda:{local_rank}"}
-        model_state = torch.load(args.ckpt_path, map_location=map_location)
-        model.load_state_dict(model_state)
+        if args.ckpt_path is not None:
+            if rank == 0:
+                print(f"Loading baseline checkpoint from {args.ckpt_path}")
+            map_location = {"cuda:0": f"cuda:{local_rank}"}
+            state = torch.load(args.ckpt_path, map_location=map_location)
+            model.load_state_dict(state)
 
-    model = model.to(device)
+        model = model.to(device)
 
-    # Optimizer over context encoder + mask token + predictor + gates
-    params = list(model.parameters())
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+        params = (
+            list(model.context_encoder.parameters())
+            + [model.mask_token]
+            + list(model.predictor.parameters())
+        )
+        optimizer = torch.optim.Adam(
+            params,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+    else:  # gated
+        model = GatedIJEPA(
+            encoder=encoder,
+            hidden_emb_dim=dim,
+            img_size=image_size,
+            patch_size=patch_size,
+            predictor_depth=depth,
+            predictor_heads=heads,
+            lambda_gates=args.lambda_gates,
+            gate_exp_alpha=args.gate_exp_alpha,
+        )
+
+        if args.ckpt_path is not None:
+            if rank == 0:
+                print(f"Loading gated checkpoint from {args.ckpt_path}")
+            map_location = {"cuda:0": f"cuda:{local_rank}"}
+            state = torch.load(args.ckpt_path, map_location=map_location)
+            model.load_state_dict(state)
+
+        model = model.to(device)
+
+        # Optimizer over all trainable params (teacher encoder has requires_grad=False)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
 
     # Wrap with DDP AFTER creating the optimizer
     ddp_model = DDP(
@@ -450,31 +436,45 @@ def main():
     if args.dataset_name != "stl10":
         raise ValueError("Only STL10 is supported in this implementation.")
 
-    stl10_ds = STL10(
+    base_ds = STL10(
         args.dataset_path,
         split="unlabeled",
-        download=(rank == 0),  # only rank0 downloads; others will reuse files
+        download=(rank == 0),
         transform=training_transforms((image_size, image_size)),
     )
 
-    # make sure all ranks wait until data is ready
+    # Ensure all ranks wait until data is ready
     dist.barrier()
 
+    if args.variant == "baseline":
+        num_patches = int((image_size // patch_size)) ** 2
+        dataset = MaskedImageDataset(
+            base_ds,
+            num_patches=num_patches,
+            num_targets=num_targets,
+        )
+    else:
+        dataset = base_ds
+
     train_sampler = DistributedSampler(
-        stl10_ds,
+        dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=True,
         drop_last=False,
     )
 
-    train_loader = DataLoader(
-        stl10_ds,
-        batch_size=args.batch_size,  # per-GPU batch size
+    loader_kwargs = dict(
+        dataset=dataset,
+        batch_size=args.batch_size,
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    if args.variant == "baseline":
+        loader_kwargs["collate_fn"] = collate_fn
+
+    train_loader = DataLoader(**loader_kwargs)
 
     scaler = GradScaler(enabled=args.fp16_precision)
 
@@ -489,15 +489,15 @@ def main():
     total_loss = 0.0
 
     if rank == 0:
+        variant_str = "baseline I-JEPA" if args.variant == "baseline" else "Gated I-JEPA"
         print(
-            f"Starting Gated I-JEPA DDP training with {world_size} GPUs, "
+            f"Starting DDP training ({variant_str}) with {world_size} GPUs, "
             f"per-GPU batch size {args.batch_size}, "
             f"effective global batch size {args.batch_size * world_size}"
         )
 
     for epoch in range(args.num_epochs):
         train_sampler.set_epoch(epoch)
-
         epoch_loss = 0.0
 
         if rank == 0:
@@ -509,40 +509,47 @@ def main():
         else:
             progress_bar = train_loader
 
-        for step, (images, _) in enumerate(progress_bar):
+        for step, batch in enumerate(progress_bar):
+            if args.variant == "baseline":
+                images, context_indices, target_indices_list = batch
+            else:
+                images, _ = batch
+
             images = images.to(device, non_blocking=True)
 
             with autocast(enabled=args.fp16_precision):
-                loss, stats = ddp_model(images)
-                # stats is a dict with keys:
-                #   pred_loss, gate_penalty, open_prob_mean, closed_prob_mean, ...
-                #   and "gate_values_full" for the full batch.
+                if args.variant == "baseline":
+                    loss = ddp_model(images, context_indices, target_indices_list)
+                    stats = None
+                else:
+                    loss, stats = ddp_model(images)
 
-            # ----------------------------
-            # Debug visualization: first step of each epoch, rank 0 only
-            # ----------------------------
-            if rank == 0 and step == 0:
-                if "gate_values_full" in stats:
-                    try:
-                        save_debug_masks(
-                            images=images,
-                            gate_values_full=stats["gate_values_full"],
-                            epoch=epoch,
-                            global_step=global_step,
-                            save_root=args.save_model_dir,
-                            image_size=image_size,
-                            patch_size=patch_size,
-                            max_images=8,
-                        )
-                    except Exception as e:
-                        print(f"[WARN] Failed to save debug masks: {e}")
+            # Gated-only debug visualization on first step of each epoch
+            if (
+                args.variant == "gated"
+                and rank == 0
+                and step == 0
+                and "gate_values_full" in (stats or {})
+            ):
+                try:
+                    save_debug_masks(
+                        images=images,
+                        gate_values_full=stats["gate_values_full"],
+                        epoch=epoch,
+                        global_step=global_step,
+                        save_root=args.save_model_dir,
+                        image_size=image_size,
+                        patch_size=patch_size,
+                        max_images=8,
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to save debug masks: {e}")
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            # EMA update schedule (same logic as train.py), but only for encoders
             if (
                 global_step > args.update_gamma_after_step
                 and global_step % args.update_gamma_every_n_steps == 0
@@ -553,7 +560,6 @@ def main():
             if global_step <= args.update_gamma_after_step:
                 ddp_model.module.copy_params()
 
-            # For logging, we can use per-rank loss; rank 0 prints.
             loss_value = loss.item()
             total_loss += loss_value
             epoch_loss += loss_value
@@ -564,36 +570,52 @@ def main():
             if rank == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
 
-                # Pull some scalars from stats
-                pred_loss = stats["pred_loss"].item()
-                gate_penalty = stats["gate_penalty"].item()
-                open_prob_mean = stats["open_prob_mean"].item()
-                closed_prob_mean = stats["closed_prob_mean"].item()
+                if args.variant == "baseline":
+                    desc = (
+                        f"Epoch {epoch+1}/{args.num_epochs} | "
+                        f"Step {global_step+1} | "
+                        f"Epoch Loss: {ep_loss:.7f} | "
+                        f"Total Loss: {avg_loss:.7f} | "
+                        f"EMA gamma: {gamma:.6f} | "
+                        f"Lr: {current_lr:.6f}"
+                    )
+                else:
+                    pred_loss = stats["pred_loss"].item()
+                    gate_penalty = stats["gate_penalty"].item()
+                    open_prob_mean = stats["open_prob_mean"].item()
+                    closed_prob_mean = stats["closed_prob_mean"].item()
 
-                progress_bar.set_description(
-                    f"Epoch {epoch+1}/{args.num_epochs} | "
-                    f"Step {global_step+1} | "
-                    f"EpLoss: {ep_loss:.4f} | "
-                    f"TotLoss: {avg_loss:.4f} | "
-                    f"Pred: {pred_loss:.4f} | "
-                    f"GatePen: {gate_penalty:.3f} | "
-                    f"Open: {open_prob_mean*100:.1f}% | "
-                    f"Closed: {closed_prob_mean*100:.1f}% | "
-                    f"EMA γ: {gamma:.4f} | "
-                    f"Lr: {current_lr:.6f}"
-                )
+                    desc = (
+                        f"Epoch {epoch+1}/{args.num_epochs} | "
+                        f"Step {global_step+1} | "
+                        f"EpLoss: {ep_loss:.4f} | "
+                        f"TotLoss: {avg_loss:.4f} | "
+                        f"Pred: {pred_loss:.4f} | "
+                        f"GatePen: {gate_penalty:.3f} | "
+                        f"Open: {open_prob_mean*100:.1f}% | "
+                        f"Closed: {closed_prob_mean*100:.1f}% | "
+                        f"EMA γ: {gamma:.4f} | "
+                        f"Lr: {current_lr:.6f}"
+                    )
+
+                progress_bar.set_description(desc)
 
             global_step += 1
 
             # Checkpointing & eval only on rank 0
             if rank == 0 and global_step % args.log_every_n_steps == 0:
                 os.makedirs(args.save_model_dir, exist_ok=True)
-                ckpt_path = os.path.join(
-                    args.save_model_dir, "training_model_gated_ddp.pth"
-                )
-                enc_path = os.path.join(
-                    args.save_model_dir, "encoder_gated_ddp.pth"
-                )
+
+                if args.variant == "baseline":
+                    ckpt_path = os.path.join(args.save_model_dir, "training_model_ddp.pth")
+                    enc_path = os.path.join(args.save_model_dir, "encoder_ddp.pth")
+                else:
+                    ckpt_path = os.path.join(
+                        args.save_model_dir, "training_model_gated_ddp.pth"
+                    )
+                    enc_path = os.path.join(
+                        args.save_model_dir, "encoder_gated_ddp.pth"
+                    )
 
                 torch.save(ddp_model.module.state_dict(), ckpt_path)
                 ddp_model.module.save_encoder(enc_path)
@@ -603,11 +625,10 @@ def main():
                 and stl10_eval is not None
                 and global_step % (args.log_every_n_steps * 5) == 0
             ):
-                # 1) (Optional) keep original target-encoder eval
-                # stl10_eval.evaluate(ddp_model.module)
-
-                # 2) Evaluate predictor features with learned gates vs all-open
-                evaluate_gated_and_all_open(stl10_eval, ddp_model.module)
+                if args.variant == "baseline":
+                    stl10_eval.evaluate(ddp_model.module)
+                else:
+                    evaluate_gated_and_all_open(stl10_eval, ddp_model.module)
 
                 print("!" * 100)
 
