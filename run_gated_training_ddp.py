@@ -25,6 +25,8 @@ import os
 import random
 import numpy as np
 
+import torch.nn.functional as F
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -38,7 +40,7 @@ from train import update_gamma  # reuse the same cosine EMA function
 
 from simple_ijepa.transformer import VisionTransformer
 from simple_ijepa.ijepa_gated import GatedIJEPA
-from simple_ijepa.stl10_eval import STL10Eval
+from simple_ijepa.stl10_eval import STL10Eval, logistic_regression
 from simple_ijepa.utils import training_transforms
 
 SEED = 42
@@ -274,6 +276,110 @@ def save_debug_masks(
         value_range=(0.0, 1.0),
     )
 
+class GatedPredictorEncoder(torch.nn.Module):
+    """
+    Wraps a GatedIJEPA model to expose a plain encoder interface:
+        forward(x) -> (B, N, D) token embeddings
+
+    mode = "gated":
+        Uses the learned gates to mix student tokens and mask token,
+        then runs the predictor.
+
+    mode = "all_open":
+        Uses the raw student tokens (no mask tokens), then runs the predictor.
+
+    These outputs can be fed into STL10Eval-style linear probing by
+    averaging over tokens.
+    """
+
+    def __init__(self, ijepa_model, mode: str = "gated"):
+        super().__init__()
+        assert mode in ("gated", "all_open")
+        self.ijepa = ijepa_model
+        self.mode = mode
+
+    @torch.inference_mode
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        m = self.ijepa
+
+        # 1) Student / context tokens
+        student_tokens = m.context_encoder(x)          # (B, N, D)
+        B, N, D = student_tokens.shape
+
+        if self.mode == "gated":
+            # 2) Learned gates
+            log_alpha = m.gate_mlp(student_tokens).squeeze(-1)   # (B, N)
+            gate_values, _ = m.gate(log_alpha, training=False)   # (B, N)
+            r = gate_values.unsqueeze(-1)                        # (B, N, 1)
+
+            # 3) Mix with mask token
+            mask_token = m.mask_token.to(device)                 # (1, D)
+            mask_tokens = mask_token.expand(B, N, D)             # (B, N, D)
+            one_minus_r = 1.0 - r
+
+            context_tokens = r * student_tokens + one_minus_r * mask_tokens
+        else:
+            # "all_open": no masking at all
+            context_tokens = student_tokens
+
+        # 4) Predictor over tokens (no patchify, no extra pos emb)
+        out = m.predictor(
+            context_tokens,
+            patchify=False,
+            pos_embed=False,
+        )
+        out = F.layer_norm(out, (out.size(-1),))                  # (B, N, D)
+
+        return out
+
+@torch.inference_mode
+def get_image_embs_labels(encoder, dataloader, device):
+    """
+    Run encoder on STL-10 loader, average over tokens, return (embs, labels)
+    suitable for scikit-learn logistic regression.
+    """
+    embs, labels = [], []
+
+    for images, targets in dataloader:
+        images = images.to(device)
+        out = encoder(images)                    # (B, N, D)
+        features = out.mean(dim=1)               # (B, D)
+
+        embs.extend(features.cpu().tolist())
+        labels.extend(targets.cpu().tolist())
+
+    return np.array(embs), np.array(labels)
+
+
+@torch.inference_mode
+def evaluate_gated_and_all_open(stl10_eval, ijepa_model):
+    """
+    Use STL10Eval's loaders, but evaluate linear probes on:
+
+      1) Predictor outputs with learned gates (mode="gated")
+      2) Predictor outputs with all gates open (mode="all_open")
+
+    This reuses the same logistic_regression function used by STL10Eval.
+    """
+    device = stl10_eval.device
+    train_loader = stl10_eval.train_loader
+    val_loader = stl10_eval.val_loader
+
+    # --- Learned gates encoder ---
+    gated_encoder = GatedPredictorEncoder(ijepa_model, mode="gated").to(device)
+    print("Evaluating STL10 with predictor + learned gates...")
+    emb_tr, lab_tr = get_image_embs_labels(gated_encoder, train_loader, device)
+    emb_val, lab_val = get_image_embs_labels(gated_encoder, val_loader, device)
+    logistic_regression(emb_tr, lab_tr, emb_val, lab_val)
+
+    # --- All-open encoder ---
+    all_open_encoder = GatedPredictorEncoder(ijepa_model, mode="all_open").to(device)
+    print("Evaluating STL10 with predictor + all gates open...")
+    emb_tr2, lab_tr2 = get_image_embs_labels(all_open_encoder, train_loader, device)
+    emb_val2, lab_val2 = get_image_embs_labels(all_open_encoder, val_loader, device)
+    logistic_regression(emb_tr2, lab_tr2, emb_val2, lab_val2)
+
 
 def main():
     args = parse_args()
@@ -324,7 +430,7 @@ def main():
 
     # Optimizer over context encoder + mask token + predictor + gates
     params = list(model.parameters())
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         params,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -497,8 +603,12 @@ def main():
                 and stl10_eval is not None
                 and global_step % (args.log_every_n_steps * 5) == 0
             ):
-                # Evaluate target encoder with linear probe
-                stl10_eval.evaluate(ddp_model.module)
+                # 1) (Optional) keep original target-encoder eval
+                # stl10_eval.evaluate(ddp_model.module)
+
+                # 2) Evaluate predictor features with learned gates vs all-open
+                evaluate_gated_and_all_open(stl10_eval, ddp_model.module)
+
                 print("!" * 100)
 
     if rank == 0:

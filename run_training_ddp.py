@@ -1,20 +1,4 @@
 # run_training_ddp.py
-#
-# DDP training script for the *gated* I-JEPA variant (GatedIJEPA).
-# Each GPU runs one process, and the model internally decides which
-# tokens to keep as context and which to mask via hard-concrete gates.
-#
-# Observability:
-#   The model returns (loss, stats) where `stats` contains:
-#     - pred_loss
-#     - gate_l0
-#     - open_prob_mean
-#     - closed_prob_mean
-#     - open_frac_per_sample
-#     - closed_frac_per_sample
-#     - gate_map_example
-#
-# We log the key scalars in the tqdm description for rank 0.
 
 import argparse
 import os
@@ -31,18 +15,20 @@ from torchvision.datasets import STL10
 
 from train import update_gamma  # reuse the same cosine EMA function
 
+from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.transformer import VisionTransformer
-from simple_ijepa.ijepa_gated import GatedIJEPA
 from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import training_transforms
+from simple_ijepa.dataset import MaskedImageDataset, collate_fn
+
 
 SEED = 42
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gated I-JEPA DDP")
+    parser = argparse.ArgumentParser(description="I-JEPA DDP")
 
-    # same interface as run_training.py (mostly retro-compatible)
+    # same interface as run_training.py (retro-compatible)
     parser.add_argument(
         "--dataset_path",
         default="./data",
@@ -128,14 +114,6 @@ def parse_args():
         help="Number of dataloader workers per process",
     )
 
-    # gating-specific hyperparameter (you can tune this)
-    parser.add_argument(
-        "--lambda_gates",
-        default=1e-3,
-        type=float,
-        help="Weight for the gate L0 penalty term.",
-    )
-
     return parser.parse_args()
 
 
@@ -172,7 +150,7 @@ def main():
     device = torch.device("cuda", local_rank)
 
     # ----------------------------
-    # Model setup (similar to train.py)
+    # Model setup (same as train.py)
     # ----------------------------
     dim = 512
     image_size = 96
@@ -180,6 +158,7 @@ def main():
     depth = 6
     heads = 6
     mlp_dim = dim * 2
+    num_targets = 4
 
     encoder = VisionTransformer(
         image_size=image_size,
@@ -190,14 +169,11 @@ def main():
         mlp_dim=mlp_dim,
     )
 
-    model = GatedIJEPA(
-        encoder=encoder,
+    ijepa = IJEPA(
+        encoder,
         hidden_emb_dim=dim,
-        img_size=image_size,
         patch_size=patch_size,
-        predictor_depth=6,
-        predictor_heads=6,
-        lambda_gates=args.lambda_gates,
+        num_targets=num_targets,
     )
 
     if args.ckpt_path is not None:
@@ -205,12 +181,16 @@ def main():
             print(f"Loading checkpoint from {args.ckpt_path}")
         map_location = {"cuda:0": f"cuda:{local_rank}"}
         model_state = torch.load(args.ckpt_path, map_location=map_location)
-        model.load_state_dict(model_state)
+        ijepa.load_state_dict(model_state)
 
-    model = model.to(device)
+    ijepa = ijepa.to(device)
 
-    # Optimizer over context encoder + mask token + predictor + gates
-    params = list(model.parameters())
+    # Optimizer over context encoder + mask token + predictor (same as train.py)
+    params = (
+        list(ijepa.context_encoder.parameters())
+        + [ijepa.mask_token]
+        + list(ijepa.predictor.parameters())
+    )
     optimizer = torch.optim.Adam(
         params,
         lr=args.learning_rate,
@@ -219,7 +199,7 @@ def main():
 
     # Wrap with DDP AFTER creating the optimizer
     ddp_model = DDP(
-        model,
+        ijepa,
         device_ids=[local_rank],
         output_device=local_rank,
         find_unused_parameters=True,
@@ -241,8 +221,15 @@ def main():
     # make sure all ranks wait until data is ready
     dist.barrier()
 
-    train_sampler = DistributedSampler(
+    num_patches = int((image_size // patch_size)) ** 2
+    dataset = MaskedImageDataset(
         stl10_ds,
+        num_patches=num_patches,
+        num_targets=num_targets,
+    )
+
+    train_sampler = DistributedSampler(
+        dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=True,
@@ -250,11 +237,12 @@ def main():
     )
 
     train_loader = DataLoader(
-        stl10_ds,
+        dataset,
         batch_size=args.batch_size,  # per-GPU batch size
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     scaler = GradScaler(enabled=args.fp16_precision)
@@ -271,7 +259,7 @@ def main():
 
     if rank == 0:
         print(
-            f"Starting Gated I-JEPA DDP training with {world_size} GPUs, "
+            f"Starting DDP training with {world_size} GPUs, "
             f"per-GPU batch size {args.batch_size}, "
             f"effective global batch size {args.batch_size * world_size}"
         )
@@ -290,20 +278,20 @@ def main():
         else:
             progress_bar = train_loader
 
-        for step, (images, _) in enumerate(progress_bar):
+        for step, (images, context_indices, target_indices_list) in enumerate(
+            progress_bar
+        ):
             images = images.to(device, non_blocking=True)
 
             with autocast(enabled=args.fp16_precision):
-                loss, stats = ddp_model(images)
-                # stats is a dict with keys:
-                #   pred_loss, gate_l0, open_prob_mean, closed_prob_mean, ...
+                loss = ddp_model(images, context_indices, target_indices_list)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            # EMA update schedule (same logic as train.py), but only for encoders
+            # EMA update schedule (same logic as train.py)
             if (
                 global_step > args.update_gamma_after_step
                 and global_step % args.update_gamma_every_n_steps == 0
@@ -314,7 +302,8 @@ def main():
             if global_step <= args.update_gamma_after_step:
                 ddp_model.module.copy_params()
 
-            # For logging, we can use per-rank loss; rank 0 prints.
+            # For logging, we can use per-rank loss;
+            # optionally, we could all_reduce but not strictly needed.
             loss_value = loss.item()
             total_loss += loss_value
             epoch_loss += loss_value
@@ -324,23 +313,12 @@ def main():
 
             if rank == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
-
-                # Pull some scalars from stats
-                pred_loss = stats["pred_loss"].item()
-                gate_l0 = stats["gate_l0"].item()
-                open_prob_mean = stats["open_prob_mean"].item()
-                closed_prob_mean = stats["closed_prob_mean"].item()
-
                 progress_bar.set_description(
                     f"Epoch {epoch+1}/{args.num_epochs} | "
                     f"Step {global_step+1} | "
-                    f"EpLoss: {ep_loss:.4f} | "
-                    f"TotLoss: {avg_loss:.4f} | "
-                    f"Pred: {pred_loss:.4f} | "
-                    f"L0: {gate_l0:.2f} | "
-                    f"Open: {open_prob_mean*100:.1f}% | "
-                    f"Closed: {closed_prob_mean*100:.1f}% | "
-                    f"EMA γ: {gamma:.4f} | "
+                    f"Epoch Loss: {ep_loss:.7f} | "
+                    f"Total Loss: {avg_loss:.7f} | "
+                    f"EMA gamma: {gamma:.6f} | "
                     f"Lr: {current_lr:.6f}"
                 )
 
@@ -349,8 +327,8 @@ def main():
             # Checkpointing & eval only on rank 0
             if rank == 0 and global_step % args.log_every_n_steps == 0:
                 os.makedirs(args.save_model_dir, exist_ok=True)
-                ckpt_path = os.path.join(args.save_model_dir, "training_model_gated_ddp.pth")
-                enc_path = os.path.join(args.save_model_dir, "encoder_gated_ddp.pth")
+                ckpt_path = os.path.join(args.save_model_dir, "training_model_ddp.pth")
+                enc_path = os.path.join(args.save_model_dir, "encoder_ddp.pth")
 
                 torch.save(ddp_model.module.state_dict(), ckpt_path)
                 ddp_model.module.save_encoder(enc_path)
