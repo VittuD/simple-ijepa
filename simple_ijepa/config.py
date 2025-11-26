@@ -20,7 +20,7 @@ class TrainConfig:
 
     # training
     num_epochs: int = 100
-    batch_size: int = 256
+    batch_size: int = 1024
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
     fp16_precision: bool = False
@@ -41,7 +41,7 @@ class TrainConfig:
     num_workers: int = 8
 
     # gated-only
-    lambda_gates: float = 1e-3
+    lambda_gates: float = 1.0
     gate_exp_alpha: float = 5.0
 
     # debugging / visualization

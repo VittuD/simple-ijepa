@@ -497,11 +497,18 @@ def main(cfg: TrainConfig):
             if (
                 rank == 0
                 and stl10_eval is not None
-                and global_step % (cfg.log_every_n_steps * 5) == 0
+                and global_step % (cfg.log_every_n_steps) == 0
             ):
                 if cfg.variant == "baseline":
                     # Standard path: use teacher encoder as in original code
+                    print("Evaluating STL10 with teacher encoder...")
                     stl10_eval.evaluate(ddp_model.module)
+                    
+                    # Comparable alternative: use student encoder
+                    print("Evaluating STL10 with student encoder...")
+                    stl10_eval.evaluate(
+                        EncoderAsIJEPA(ddp_model.module.context_encoder)
+                    )
                 else:
                     # Reuse STL10Eval by wrapping custom encoders
                     print("Evaluating STL10 with predictor + learned gates...")
