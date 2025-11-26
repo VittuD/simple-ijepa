@@ -20,7 +20,7 @@ from train import update_gamma
 from simple_ijepa.transformer import VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.ijepa_gated import GatedIJEPA
-from simple_ijepa.stl10_eval import STL10Eval, logistic_regression
+from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import training_transforms
 from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
@@ -174,6 +174,7 @@ class GatedPredictorEncoder(torch.nn.Module):
 
             context_tokens = r * student_tokens + one_minus_r * mask_tokens
         else:
+            # "all_open": just use the student tokens directly
             context_tokens = student_tokens
 
         out = m.predictor(
@@ -186,38 +187,14 @@ class GatedPredictorEncoder(torch.nn.Module):
         return out
 
 
-@torch.inference_mode
-def get_image_embs_labels(encoder, dataloader, device):
-    embs, labels = [], []
+class EncoderAsIJEPA:
+    """
+    Tiny shim so we can re-use STL10Eval.evaluate(), which expects
+    an object with a `.target_encoder` attribute.
+    """
 
-    for images, targets in dataloader:
-        images = images.to(device)
-        out = encoder(images)  # (B, N, D)
-        features = out.mean(dim=1)
-
-        embs.extend(features.cpu().tolist())
-        labels.extend(targets.cpu().tolist())
-
-    return np.array(embs), np.array(labels)
-
-
-@torch.inference_mode
-def evaluate_gated_and_all_open(stl10_eval, ijepa_model):
-    device = stl10_eval.device
-    train_loader = stl10_eval.train_loader
-    val_loader = stl10_eval.val_loader
-
-    gated_encoder = GatedPredictorEncoder(ijepa_model, mode="gated").to(device)
-    print("Evaluating STL10 with predictor + learned gates...")
-    emb_tr, lab_tr = get_image_embs_labels(gated_encoder, train_loader, device)
-    emb_val, lab_val = get_image_embs_labels(gated_encoder, val_loader, device)
-    logistic_regression(emb_tr, lab_tr, emb_val, lab_val)
-
-    all_open_encoder = GatedPredictorEncoder(ijepa_model, mode="all_open").to(device)
-    print("Evaluating STL10 with predictor + all gates open...")
-    emb_tr2, lab_tr2 = get_image_embs_labels(all_open_encoder, train_loader, device)
-    emb_val2, lab_val2 = get_image_embs_labels(all_open_encoder, val_loader, device)
-    logistic_regression(emb_tr2, lab_tr2, emb_val2, lab_val2)
+    def __init__(self, encoder: torch.nn.Module):
+        self.target_encoder = encoder
 
 
 @hydra.main(version_base=None, config_name="train_config")
@@ -523,9 +500,21 @@ def main(cfg: TrainConfig):
                 and global_step % (cfg.log_every_n_steps * 5) == 0
             ):
                 if cfg.variant == "baseline":
+                    # Standard path: use teacher encoder as in original code
                     stl10_eval.evaluate(ddp_model.module)
                 else:
-                    evaluate_gated_and_all_open(stl10_eval, ddp_model.module)
+                    # Reuse STL10Eval by wrapping custom encoders
+                    print("Evaluating STL10 with predictor + learned gates...")
+                    gated_encoder = GatedPredictorEncoder(
+                        ddp_model.module, mode="gated"
+                    ).to(stl10_eval.device)
+                    stl10_eval.evaluate(EncoderAsIJEPA(gated_encoder))
+
+                    print("Evaluating STL10 with predictor + all gates open...")
+                    all_open_encoder = GatedPredictorEncoder(
+                        ddp_model.module, mode="all_open"
+                    ).to(stl10_eval.device)
+                    stl10_eval.evaluate(EncoderAsIJEPA(all_open_encoder))
 
                 print("!" * 100)
 
