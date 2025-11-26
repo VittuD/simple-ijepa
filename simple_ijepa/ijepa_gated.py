@@ -33,7 +33,7 @@ class GatedIJEPA(BaseIJEPA):
       * Gating network on student tokens:
 
           log α = g_ϕ(z^{(S)}) ∈ R^{N}
-          r ∼ HardConcrete(log α) ∈ [0, 1]^N
+          r ~ HardConcrete(log α) ∈ [0, 1]^N
 
         Each gate r_i is interpreted as:
           r_i ≈ 1   -> token i is "open" (visible context)
@@ -136,10 +136,11 @@ class GatedIJEPA(BaseIJEPA):
         self.mask_token = nn.Parameter(torch.zeros(1, hidden_emb_dim))
         trunc_normal_(self.mask_token, mean=0.0, std=0.02)
 
-        # Simple per-token gating head over student embeddings:
-        #   log α_{b,i} = wᵀ LN(z^{(S)}_{b,i}) + b
+        # Two-layer MLP with non-linearity and sigmoid to squash output
         self.gate_mlp = nn.Sequential(
             nn.LayerNorm(hidden_emb_dim),
+            nn.Linear(hidden_emb_dim, hidden_emb_dim),
+            nn.ReLU(),
             nn.Linear(hidden_emb_dim, 1),
         )
 
