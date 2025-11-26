@@ -118,8 +118,8 @@ class VisionTransformer(nn.Module):
             w=image_width // patch_width,
             dim=dim,
         )
-        # Now a non-trainable buffer that moves with model.to(device)
-        self.register_buffer("pos_embedding", pe, persistent=False)
+        # Trainable parameter initialized with sin-cos
+        self.pos_embedding = nn.Parameter(pe)
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
 
