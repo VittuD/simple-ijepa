@@ -1,4 +1,3 @@
-import argparse
 import os
 import random
 import numpy as np
@@ -13,6 +12,9 @@ from tqdm.auto import tqdm
 from torchvision.datasets import STL10
 from torchvision.utils import save_image
 
+import hydra
+from hydra.utils import get_original_cwd
+
 from train import update_gamma
 
 from simple_ijepa.transformer import VisionTransformer
@@ -22,129 +24,10 @@ from simple_ijepa.stl10_eval import STL10Eval, logistic_regression
 from simple_ijepa.utils import training_transforms
 from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
+from simple_ijepa.config import TrainConfig
+
 
 SEED = 42
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="I-JEPA DDP (baseline or gated variant)"
-    )
-
-    parser.add_argument(
-        "--variant",
-        default="baseline",
-        choices=["baseline", "gated"],
-        help="Which model variant to train: 'baseline' (IJEPA) or 'gated' (GatedIJEPA).",
-    )
-
-    # Common args (kept backward compatible with existing scripts)
-    parser.add_argument(
-        "--dataset_path",
-        default="./data",
-        help="Path where datasets will be saved",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        default="stl10",
-        choices=["stl10"],
-        help="Dataset name",
-    )
-    parser.add_argument(
-        "-save_model_dir",
-        default="./models",
-        help="Path where models will be saved",
-    )
-    parser.add_argument(
-        "--num_epochs",
-        default=100,
-        type=int,
-        help="Number of epochs for training",
-    )
-    parser.add_argument(
-        "-b",
-        "--batch_size",
-        default=256,
-        type=int,
-        help="Per-process batch size (per GPU)",
-    )
-    parser.add_argument(
-        "-lr",
-        "--learning_rate",
-        default=3e-4,
-        type=float,
-    )
-    parser.add_argument(
-        "-wd",
-        "--weight_decay",
-        default=1e-5,
-        type=float,
-    )
-    parser.add_argument(
-        "--fp16_precision",
-        action="store_true",
-        help="Use 16-bit precision for GPU training",
-    )
-    parser.add_argument(
-        "--emb_dim",
-        default=768,
-        type=int,
-        help="Transformer embedding dimm (unused here, fixed 512 in code)",
-    )
-    parser.add_argument(
-        "--log_every_n_steps",
-        default=200,
-        type=int,
-        help="Log / save every n steps (global steps, not epochs)",
-    )
-    parser.add_argument(
-        "--gamma",
-        default=0.996,
-        type=float,
-        help="Initial EMA coefficient",
-    )
-    parser.add_argument(
-        "--update_gamma_after_step",
-        default=1,
-        type=int,
-        help="Update EMA gamma after this step",
-    )
-    parser.add_argument(
-        "--update_gamma_every_n_steps",
-        default=1,
-        type=int,
-        help="Update EMA gamma after this many steps",
-    )
-    parser.add_argument(
-        "--ckpt_path",
-        default=None,
-        type=str,
-        help="Path to training_model.pth to resume training",
-    )
-
-    # Dataloader workers (both variants)
-    parser.add_argument(
-        "--num_workers",
-        default=8,
-        type=int,
-        help="Number of dataloader workers per process",
-    )
-
-    # Gated-only knobs (ignored for baseline)
-    parser.add_argument(
-        "--lambda_gates",
-        default=1e-3,
-        type=float,
-        help="[gated] Weight for the gate penalty term.",
-    )
-    parser.add_argument(
-        "--gate_exp_alpha",
-        default=5.0,
-        type=float,
-        help="[gated] Sharpness of exponential gate penalty as open fraction -> 1.",
-    )
-
-    return parser.parse_args()
 
 
 def setup_distributed():
@@ -337,8 +220,15 @@ def evaluate_gated_and_all_open(stl10_eval, ijepa_model):
     logistic_regression(emb_tr2, lab_tr2, emb_val2, lab_val2)
 
 
-def main():
-    args = parse_args()
+@hydra.main(version_base=None, config_name="train_config")
+def main(cfg: TrainConfig):
+    # Make dataset & model dirs relative to the original project root,
+    # not Hydra's per-run working directory.
+    root = get_original_cwd()
+    if not os.path.isabs(cfg.dataset_path):
+        cfg.dataset_path = os.path.join(root, cfg.dataset_path)
+    if not os.path.isabs(cfg.save_model_dir):
+        cfg.save_model_dir = os.path.join(root, cfg.save_model_dir)
 
     rank, local_rank, world_size = setup_distributed()
     set_seed(SEED, rank)
@@ -366,7 +256,7 @@ def main():
         mlp_dim=mlp_dim,
     )
 
-    if args.variant == "baseline":
+    if cfg.variant == "baseline":
         model = IJEPA(
             encoder,
             hidden_emb_dim=dim,
@@ -374,11 +264,11 @@ def main():
             num_targets=num_targets,
         )
 
-        if args.ckpt_path is not None:
+        if cfg.ckpt_path is not None:
             if rank == 0:
-                print(f"Loading baseline checkpoint from {args.ckpt_path}")
+                print(f"Loading baseline checkpoint from {cfg.ckpt_path}")
             map_location = {"cuda:0": f"cuda:{local_rank}"}
-            state = torch.load(args.ckpt_path, map_location=map_location)
+            state = torch.load(cfg.ckpt_path, map_location=map_location)
             model.load_state_dict(state)
 
         model = model.to(device)
@@ -390,8 +280,8 @@ def main():
         )
         optimizer = torch.optim.Adam(
             params,
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
         )
 
     else:  # gated
@@ -402,24 +292,23 @@ def main():
             patch_size=patch_size,
             predictor_depth=depth,
             predictor_heads=heads,
-            lambda_gates=args.lambda_gates,
-            gate_exp_alpha=args.gate_exp_alpha,
+            lambda_gates=cfg.lambda_gates,
+            gate_exp_alpha=cfg.gate_exp_alpha,
         )
 
-        if args.ckpt_path is not None:
+        if cfg.ckpt_path is not None:
             if rank == 0:
-                print(f"Loading gated checkpoint from {args.ckpt_path}")
+                print(f"Loading gated checkpoint from {cfg.ckpt_path}")
             map_location = {"cuda:0": f"cuda:{local_rank}"}
-            state = torch.load(args.ckpt_path, map_location=map_location)
+            state = torch.load(cfg.ckpt_path, map_location=map_location)
             model.load_state_dict(state)
 
         model = model.to(device)
 
-        # Optimizer over all trainable params (teacher encoder has requires_grad=False)
         optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
         )
 
     # Wrap with DDP AFTER creating the optimizer
@@ -427,19 +316,19 @@ def main():
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=False,      # no need to track unused params
-        gradient_as_bucket_view=True,      # reuse bucket buffers as grads
-        static_graph=True,                 # graph structure doesn't change across steps
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,
+        static_graph=True,
     )
 
     # ----------------------------
     # Dataset & DataLoader (DDP)
     # ----------------------------
-    if args.dataset_name != "stl10":
+    if cfg.dataset_name != "stl10":
         raise ValueError("Only STL10 is supported in this implementation.")
 
     base_ds = STL10(
-        args.dataset_path,
+        cfg.dataset_path,
         split="unlabeled",
         download=(rank == 0),
         transform=training_transforms((image_size, image_size)),
@@ -448,7 +337,7 @@ def main():
     # Ensure all ranks wait until data is ready
     dist.barrier()
 
-    if args.variant == "baseline":
+    if cfg.variant == "baseline":
         num_patches = int((image_size // patch_size)) ** 2
         dataset = MaskedImageDataset(
             base_ds,
@@ -468,68 +357,73 @@ def main():
 
     loader_kwargs = dict(
         dataset=dataset,
-        batch_size=args.batch_size,
+        batch_size=cfg.batch_size,
         sampler=train_sampler,
-        num_workers=args.num_workers,
+        num_workers=cfg.num_workers,
         pin_memory=True,
     )
-    if args.variant == "baseline":
+    if cfg.variant == "baseline":
         loader_kwargs["collate_fn"] = collate_fn
 
     train_loader = DataLoader(**loader_kwargs)
 
-    scaler = GradScaler(enabled=args.fp16_precision)
+    scaler = GradScaler(enabled=cfg.fp16_precision)
 
     # Only rank 0 will run linear probing evals & print accuracy
-    stl10_eval = STL10Eval(image_size=image_size,
-                       dataset_path=args.dataset_path) if rank == 0 else None
+    stl10_eval = (
+        STL10Eval(image_size=image_size, dataset_path=cfg.dataset_path)
+        if rank == 0
+        else None
+    )
 
     total_num_steps = (
-        len(train_loader) * (args.num_epochs + 2)
-    ) - args.update_gamma_after_step
-    gamma = args.gamma
+        len(train_loader) * (cfg.num_epochs + 2)
+    ) - cfg.update_gamma_after_step
+    gamma = cfg.gamma
     global_step = 0
     total_loss = 0.0
 
     if rank == 0:
-        variant_str = "baseline I-JEPA" if args.variant == "baseline" else "Gated I-JEPA"
+        variant_str = "baseline I-JEPA" if cfg.variant == "baseline" else "Gated I-JEPA"
         print(
             f"Starting DDP training ({variant_str}) with {world_size} GPUs, "
-            f"per-GPU batch size {args.batch_size}, "
-            f"effective global batch size {args.batch_size * world_size}"
+            f"per-GPU batch size {cfg.batch_size}, "
+            f"effective global batch size {cfg.batch_size * world_size}"
         )
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(cfg.num_epochs):
         train_sampler.set_epoch(epoch)
         epoch_loss = 0.0
 
         if rank == 0:
             progress_bar = tqdm(
                 train_loader,
-                desc=f"Epoch {epoch + 1}/{args.num_epochs}",
+                desc=f"Epoch {epoch + 1}/{cfg.num_epochs}",
                 leave=True,
             )
         else:
             progress_bar = train_loader
 
         for step, batch in enumerate(progress_bar):
-            if args.variant == "baseline":
+            if cfg.variant == "baseline":
                 images, context_indices, target_indices_list = batch
             else:
                 images, _ = batch
 
             images = images.to(device, non_blocking=True)
 
-            with autocast(enabled=args.fp16_precision):
-                if args.variant == "baseline":
+            with autocast(enabled=cfg.fp16_precision):
+                if cfg.variant == "baseline":
                     loss = ddp_model(images, context_indices, target_indices_list)
                     stats = None
                 else:
                     loss, stats = ddp_model(images)
 
-            # Gated-only debug visualization on first step of each epoch
+            # Gated-only debug visualization on first step of each epoch,
+            # controlled by cfg.save_debug_masks
             if (
-                args.variant == "gated"
+                cfg.variant == "gated"
+                and cfg.save_debug_masks
                 and rank == 0
                 and step == 0
                 and "gate_values_full" in (stats or {})
@@ -540,7 +434,7 @@ def main():
                         gate_values_full=stats["gate_values_full"],
                         epoch=epoch,
                         global_step=global_step,
-                        save_root=args.save_model_dir,
+                        save_root=cfg.save_model_dir,
                         image_size=image_size,
                         patch_size=patch_size,
                         max_images=8,
@@ -554,13 +448,13 @@ def main():
             scaler.update()
 
             if (
-                global_step > args.update_gamma_after_step
-                and global_step % args.update_gamma_every_n_steps == 0
+                global_step > cfg.update_gamma_after_step
+                and global_step % cfg.update_gamma_every_n_steps == 0
             ):
                 ddp_model.module.update_params(gamma)
-                gamma = update_gamma(global_step, total_num_steps, args.gamma)
+                gamma = update_gamma(global_step, total_num_steps, cfg.gamma)
 
-            if global_step <= args.update_gamma_after_step:
+            if global_step <= cfg.update_gamma_after_step:
                 ddp_model.module.copy_params()
 
             loss_value = loss.item()
@@ -573,9 +467,9 @@ def main():
             if rank == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
 
-                if args.variant == "baseline":
+                if cfg.variant == "baseline":
                     desc = (
-                        f"Epoch {epoch+1}/{args.num_epochs} | "
+                        f"Epoch {epoch+1}/{cfg.num_epochs} | "
                         f"Step {global_step+1} | "
                         f"Epoch Loss: {ep_loss:.7f} | "
                         f"Total Loss: {avg_loss:.7f} | "
@@ -589,7 +483,7 @@ def main():
                     closed_prob_mean = stats["closed_prob_mean"].item()
 
                     desc = (
-                        f"Epoch {epoch+1}/{args.num_epochs} | "
+                        f"Epoch {epoch+1}/{cfg.num_epochs} | "
                         f"Step {global_step+1} | "
                         f"EpLoss: {ep_loss:.4f} | "
                         f"TotLoss: {avg_loss:.4f} | "
@@ -606,18 +500,18 @@ def main():
             global_step += 1
 
             # Checkpointing & eval only on rank 0
-            if rank == 0 and global_step % args.log_every_n_steps == 0:
-                os.makedirs(args.save_model_dir, exist_ok=True)
+            if rank == 0 and global_step % cfg.log_every_n_steps == 0:
+                os.makedirs(cfg.save_model_dir, exist_ok=True)
 
-                if args.variant == "baseline":
-                    ckpt_path = os.path.join(args.save_model_dir, "training_model_ddp.pth")
-                    enc_path = os.path.join(args.save_model_dir, "encoder_ddp.pth")
+                if cfg.variant == "baseline":
+                    ckpt_path = os.path.join(cfg.save_model_dir, "training_model_ddp.pth")
+                    enc_path = os.path.join(cfg.save_model_dir, "encoder_ddp.pth")
                 else:
                     ckpt_path = os.path.join(
-                        args.save_model_dir, "training_model_gated_ddp.pth"
+                        cfg.save_model_dir, "training_model_gated_ddp.pth"
                     )
                     enc_path = os.path.join(
-                        args.save_model_dir, "encoder_gated_ddp.pth"
+                        cfg.save_model_dir, "encoder_gated_ddp.pth"
                     )
 
                 torch.save(ddp_model.module.state_dict(), ckpt_path)
@@ -626,9 +520,9 @@ def main():
             if (
                 rank == 0
                 and stl10_eval is not None
-                and global_step % (args.log_every_n_steps * 5) == 0
+                and global_step % (cfg.log_every_n_steps * 5) == 0
             ):
-                if args.variant == "baseline":
+                if cfg.variant == "baseline":
                     stl10_eval.evaluate(ddp_model.module)
                 else:
                     evaluate_gated_and_all_open(stl10_eval, ddp_model.module)

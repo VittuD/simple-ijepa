@@ -33,6 +33,7 @@ setup(
         'datasets>=2.15',
         'tqdm>=4.66',
         'torchinfo>=1.8.0',
+        'hydra-core>=1.3.2',
     ],
     classifiers=[
         'Development Status :: 4 - Beta',
