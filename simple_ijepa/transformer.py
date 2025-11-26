@@ -113,27 +113,30 @@ class VisionTransformer(nn.Module):
             nn.LayerNorm(dim),
         )
 
-        self.pos_embedding = posemb_sincos_2d(
+        pe = posemb_sincos_2d(
             h=image_height // patch_height,
             w=image_width // patch_width,
             dim=dim,
         )
-        self.pos_embedding.requires_grad_(False)
+        # Now a non-trainable buffer that moves with model.to(device)
+        self.register_buffer("pos_embedding", pe, persistent=False)
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
 
     def forward(self, x, patchify=True, pos_embed=True, mask=None):
-        device = x.device
-
         if patchify:
             x = self.to_patch_embedding(x)
 
         if pos_embed:
-            x += self.pos_embedding.to(device, dtype=x.dtype)
+            # pos_embedding is already on the right device as a buffer
+            x = x + self.pos_embedding
 
         if mask is not None:
-            x = torch.gather(x, 1,
-                             mask.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+            x = torch.gather(
+                x,
+                1,
+                mask.unsqueeze(-1).expand(-1, -1, x.size(-1)),
+            )
 
         x = self.transformer(x)
         return x

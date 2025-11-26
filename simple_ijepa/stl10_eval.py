@@ -33,16 +33,16 @@ def logistic_regression(embeddings, labels, embeddings_val, labels_val):
 
 class STL10Eval:
 
-    def __init__(self, image_size=96):
+    def __init__(self, image_size=96, dataset_path="data/"):
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
 
         transform = inference_transforms(img_size=(image_size, image_size))
-        train_ds = torchvision.datasets.STL10(dataset_path,
+        train_ds = torchvision.datasets.STL10(root=dataset_path,
                                               split='train',
                                               transform=transform,
                                               download=True)
-        val_ds = torchvision.datasets.STL10(dataset_path,
+        val_ds = torchvision.datasets.STL10(root=dataset_path,
                                             split='test',
                                             transform=transform,
                                             download=True)

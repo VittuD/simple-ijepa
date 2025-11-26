@@ -427,7 +427,9 @@ def main():
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=False,      # no need to track unused params
+        gradient_as_bucket_view=True,      # reuse bucket buffers as grads
+        static_graph=True,                 # graph structure doesn't change across steps
     )
 
     # ----------------------------
