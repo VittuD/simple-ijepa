@@ -1,6 +1,9 @@
 from torchvision import transforms
+from torchvision.utils import save_image
+import torch.nn.functional as F
 import torch
-import math, warnings
+import math, warnings, os
+import matplotlib.pyplot as plt
 
 
 def training_transforms(img_size):
@@ -80,3 +83,236 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     """
     with torch.no_grad():
         return _trunc_normal_(tensor, mean, std, a, b)
+
+
+# -----------------------------
+# Gated-specific utilities
+# -----------------------------
+def save_debug_masks(
+    images: torch.Tensor,
+    gate_values_full: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    image_size: int,
+    patch_size: int,
+    max_images: int = 8,
+) -> None:
+    """
+    Save original and patch-masked versions of the first few images in the batch,
+    using the gate values to decide which patches to "mask".
+    """
+    os.makedirs(os.path.join(save_root, "debug_masks"), exist_ok=True)
+    debug_dir = os.path.join(save_root, "debug_masks")
+
+    B, C, H, W = images.shape
+    assert H == image_size and W == image_size, "Unexpected image size."
+
+    num_to_save = min(max_images, B)
+    H_p = image_size // patch_size
+    W_p = image_size // patch_size
+    N = H_p * W_p
+
+    assert gate_values_full.shape[0] == B
+    assert gate_values_full.shape[1] == N, "gate_values_full has wrong length."
+
+    images_cpu = images[:num_to_save].detach().cpu()
+    gates_cpu = gate_values_full[:num_to_save].detach().cpu()  # (K, N)
+
+    masked_images = []
+
+    for idx in range(num_to_save):
+        img = images_cpu[idx].clone()
+        g = gates_cpu[idx]
+
+        gate_map = g.view(H_p, W_p)
+        img_masked = img.clone()
+
+        for ph in range(H_p):
+            for pw in range(W_p):
+                if gate_map[ph, pw] < 0.5:
+                    h0 = ph * patch_size
+                    h1 = h0 + patch_size
+                    w0 = pw * patch_size
+                    w1 = w0 + patch_size
+
+                    img_masked[:, h0:h1, w0:w1] = 0.0
+
+                    size = patch_size
+                    diag = torch.arange(size)
+
+                    img_masked[:, h0 + diag, w0 + diag] = 0.7
+                    img_masked[:, h0 + diag, w1 - 1 - diag] = 0.7
+
+        masked_images.append(img_masked)
+
+    masked_batch = torch.stack(masked_images, dim=0)
+
+    step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
+    orig_path = os.path.join(debug_dir, f"{step_str}_orig.png")
+    masked_path = os.path.join(debug_dir, f"{step_str}_masked.png")
+
+    save_image(
+        images_cpu,
+        orig_path,
+        nrow=num_to_save,
+        normalize=True,
+        value_range=(0.0, 1.0),
+    )
+    save_image(
+        masked_batch,
+        masked_path,
+        nrow=num_to_save,
+        normalize=True,
+        value_range=(0.0, 1.0),
+    )
+
+
+class GatedPredictorEncoder(torch.nn.Module):
+    """
+    Wraps a GatedIJEPA model to expose a plain encoder interface:
+        forward(x) -> (B, N, D) token embeddings
+
+    mode = "gated":
+        - If gate_layer_index is None:
+            Uses the learned gates on final encoder tokens to mix student
+            tokens and mask token, then runs the predictor.
+        - If gate_layer_index is not None:
+            Reuses the *internal* gating path used during training
+            (gating after the chosen transformer block), then runs the
+            predictor on the final masked tokens.
+
+    mode = "all_open":
+        Uses the raw student tokens (no gating anywhere), then runs the
+        predictor. This is a clean ablation: "what if we never gated?".
+    """
+
+    def __init__(self, ijepa_model, mode: str = "gated"):
+        super().__init__()
+        assert mode in ("gated", "all_open")
+        self.ijepa = ijepa_model
+        self.mode = mode
+
+    @torch.inference_mode
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        m = self.ijepa
+        device = x.device
+
+        # "all_open": no gating, no masking
+        if self.mode == "all_open":
+            student_tokens = m.context_encoder(x)  # plain VisionTransformer
+            context_tokens = student_tokens
+
+        else:  # "gated"
+            depth = len(m.context_encoder.transformer.layers)
+            gate_layer_index = getattr(m, "gate_layer_index", None)
+
+            use_internal_gating = (
+                gate_layer_index is not None
+                and 0 <= gate_layer_index < depth
+            )
+
+            if use_internal_gating:
+                # Use the same internal gating path as in training
+                student_tokens, gate_values, gate_probs, _ = (
+                    m._encode_student_with_internal_gating(x)
+                )
+                context_tokens = student_tokens
+            else:
+                # Original behavior: gate final encoder tokens outside encoder
+                student_tokens = m.context_encoder(x)  # (B, N, D)
+                B, N, D = student_tokens.shape
+
+                log_alpha = m.gate_mlp(student_tokens).squeeze(-1)  # (B, N)
+                log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+                gate_values, _ = m.gate(log_alpha, training=False)  # (B, N)
+                r = gate_values.unsqueeze(-1)
+
+                mask_token = m.mask_token.to(device)
+                mask_tokens = mask_token.expand(B, N, D)
+                one_minus_r = 1.0 - r
+
+                context_tokens = r * student_tokens + one_minus_r * mask_tokens
+
+        out = m.predictor(
+            context_tokens,
+            patchify=False,
+            pos_embed=False,
+        )
+        out = F.layer_norm(out, (out.size(-1),))
+
+        return out
+
+
+# ----------------------------------------------------------------------
+# SSIM utilities for token embeddings
+# ----------------------------------------------------------------------
+
+def compute_token_ssim_matrix(
+    tokens: torch.Tensor,
+    c1: float = 1e-4,
+    c2: float = 9e-4,
+) -> torch.Tensor:
+    """
+    Compute an "SSIM-style" similarity matrix between token vectors.
+
+    Args:
+        tokens: Tensor of shape (N, D), where N is number of tokens and
+                D is embedding dimension (e.g., input to gate MLP).
+        c1, c2: Small constants for numerical stability, analogous to
+                standard SSIM.
+
+    Returns:
+        ssim: Tensor of shape (N, N), where ssim[i, j] is the structural
+              similarity between token i and token j (in embedding space).
+    """
+    # tokens: (N, D)
+    x = tokens  # (N, D)
+    N, D = x.shape
+
+    # Mean per token (over feature dim)
+    mu = x.mean(dim=1, keepdim=True)          # (N, 1)
+    x_centered = x - mu                       # (N, D)
+    var = (x_centered ** 2).mean(dim=1, keepdim=True)  # (N, 1)
+
+    # Covariance between token i and j:
+    # cov[i,j] = E_d[(x_i_d - mu_i)*(x_j_d - mu_j)]
+    cov = (x_centered @ x_centered.T) / D     # (N, N)
+
+    mu_i = mu                                 # (N, 1)
+    mu_j = mu.T                               # (1, N)
+    var_i = var                               # (N, 1)
+    var_j = var.T                             # (1, N)
+
+    num = (2 * mu_i * mu_j + c1) * (2 * cov + c2)
+    den = (mu_i ** 2 + mu_j ** 2 + c1) * (var_i + var_j + c2)
+
+    ssim = num / (den + 1e-12)
+    ssim = torch.clamp(ssim, -1.0, 1.0)
+    return ssim
+
+
+def save_ssim_heatmap(
+    ssim_matrix: torch.Tensor,
+    out_path: str,
+    title: str = "Token SSIM",
+) -> None:
+    """
+    Save a heatmap visualization of an SSIM matrix.
+
+    Args:
+        ssim_matrix: Tensor of shape (N, N).
+        out_path:    Path to save the PNG.
+        title:       Plot title.
+    """
+    mat = ssim_matrix.detach().cpu().numpy()
+
+    plt.figure(figsize=(5, 4))
+    im = plt.imshow(mat, origin="lower", aspect="equal", vmin=-1.0, vmax=1.0)
+    plt.title(title)
+    plt.xlabel("Token index")
+    plt.ylabel("Token index")
+    plt.colorbar(im, fraction=0.046, pad=0.04, label="SSIM")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
