@@ -30,7 +30,7 @@ class GatedIJEPA(BaseIJEPA):
 
           z^{(S)} = h_θ(x) ∈ R^{N×D}
 
-      * Gating network on student tokens:
+      * Gating network on (intermediate or final) student tokens:
 
           log α = g_ϕ(z^{(S)}) ∈ R^{N}
           r ~ HardConcrete(log α) ∈ [0, 1]^N
@@ -39,24 +39,25 @@ class GatedIJEPA(BaseIJEPA):
           r_i ≈ 1   -> token i is "open" (visible context)
           r_i ≈ 0   -> token i is "closed" (masked, to be predicted)
 
-      * Masked input to the predictor:
+      * Masked tokens:
 
           c_i = r_i · z^{(S)}_i + (1 - r_i) · m
 
         where m ∈ R^D is a learned mask token shared across positions.
 
-        Stack all tokens:
+        Depending on where gating is applied:
 
-          C = [c_1, …, c_N]ᵀ ∈ R^{N×D}
+          - If done "at the end" (gate_layer_index is None), c_i is built
+            from the final encoder tokens and only affects the predictor input.
 
-      * Predictor:
-
-          ẑ = p_ψ(C) ∈ R^{N×D}
+          - If done after an earlier transformer block, c_i replaces the
+            tokens that feed into subsequent transformer blocks, so later
+            layers operate on a masked sequence.
 
     Loss
     ----
     The prediction loss is an MSE over *all* tokens (gates only affect the
-    predictor input, not which tokens are evaluated):
+    predictor input / intermediate states, not which tokens are evaluated):
 
         L_pred = mean_{b,i} || LN(ẑ_{b,i}) - LN(z^{(T)}_{b,i}) ||².
 
@@ -73,14 +74,39 @@ class GatedIJEPA(BaseIJEPA):
     Then:
 
         L_gates = (1 / B) ∑_b p_b
-
         L_total = L_pred + λ_gates · L_gates.
 
-    Intuition:
-      * L_pred encourages accurate prediction of teacher embeddings for all
-        tokens given the masked context.
-      * L_gates discourages using too many open gates, with a gentle penalty
-        for small fractions and a sharply increasing penalty as f_b → 1.
+    Gating location
+    ---------------
+    Two knobs:
+
+      * gate_layer_index ∈ {0, …, depth-1} or None
+
+          - None: gating is applied on the final encoder tokens, *outside*
+            the transformer. The encoder always sees the full unmasked image,
+            only the predictor sees masked tokens.
+
+          - k: we run the context encoder block-by-block. At block k we
+            apply gating, and the remaining blocks see masked tokens.
+
+      * gate_inside_block ∈ {False, True}
+
+          - False (default):
+               gate MLP is applied to the *output* of the entire block:
+                   x ← Attn(x) + x
+                   x ← FFN(x) + x
+                   [gate here on x]
+
+          - True:
+               gate MLP is applied *inside* the block, after attention but
+               before the residual connection and FFN:
+                   y = Attn(x)
+                   [gate here on y]
+                   x ← y_gated + x
+                   x ← FFN(x) + x
+
+        This allows you to force the model to decide what to keep/drop earlier
+        in the computation, before representations fully oversmooth.
 
     Observability
     -------------
@@ -110,6 +136,8 @@ class GatedIJEPA(BaseIJEPA):
         gate_gamma: float = -0.1,
         gate_zeta: float = 1.1,
         gate_exp_alpha: float = 5.0,
+        gate_layer_index: int | None = None,
+        gate_location: str = "post",
     ) -> None:
         # Set up context/target encoders and EMA utilities
         super().__init__(encoder=encoder)
@@ -118,6 +146,17 @@ class GatedIJEPA(BaseIJEPA):
         self.img_size = img_size
         self.lambda_gates = lambda_gates
         self.gate_exp_alpha = gate_exp_alpha
+
+        # Where to apply gating inside the context encoder.
+        # None => gating on final tokens (outside encoder).
+        # k    => gating at transformer block k (location controlled by gate_location).
+        self.gate_layer_index = gate_layer_index
+
+        assert gate_location in ("attn", "skip", "post"), (
+            f"gate_location must be one of 'attn', 'skip', 'post', "
+            f"got {gate_location!r}"
+        )
+        self.gate_location = gate_location
 
         # Derived: number of patches per spatial dimension
         self.num_patches_per_dim = img_size // patch_size
@@ -136,11 +175,10 @@ class GatedIJEPA(BaseIJEPA):
         self.mask_token = nn.Parameter(torch.zeros(1, hidden_emb_dim))
         trunc_normal_(self.mask_token, mean=0.0, std=0.02)
 
-        # Two-layer MLP with non-linearity and sigmoid to squash output
+        # Simple per-token gating head over embeddings:
+        #   log α_{b,i} = wᵀ LN(z_{b,i}) + b
         self.gate_mlp = nn.Sequential(
             nn.LayerNorm(hidden_emb_dim),
-            nn.Linear(hidden_emb_dim, hidden_emb_dim),
-            nn.ReLU(),
             nn.Linear(hidden_emb_dim, 1),
         )
 
@@ -152,6 +190,150 @@ class GatedIJEPA(BaseIJEPA):
             gamma=gate_gamma,
             zeta=gate_zeta,
         )
+
+
+    def _encode_student_with_internal_gating(
+        self,
+        img: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run the context encoder block-by-block, applying gating at a given
+        transformer block index (self.gate_layer_index). The remaining blocks
+        see masked tokens.
+
+        gate_location controls *where* in the block we gate:
+
+          - "attn":
+              y = Attn(x)
+              [gate on y]
+              x = y_gated + x
+              x = FFN(x) + x
+
+          - "skip":
+              y = Attn(x)
+              x_skip = y + x
+              [gate on x_skip]
+              x = x_gated
+              x = FFN(x) + x
+
+          - "post":
+              x = Attn(x) + x
+              x = FFN(x) + x
+              [gate on x]
+
+        Returns:
+            student_tokens:          (B, N, D) final normalized tokens after all blocks
+                                     (already influenced by gating).
+            gate_values:             (B, N) sampled gate values in [0, 1]
+            gate_probs:              (B, N) open probabilities π_{b,i}
+            gate_mlp_input_example:  (N, D) the *token matrix* that was fed
+                                     into gate_mlp, for a representative sample
+                                     (used for SSIM observability).
+        """
+        vt = self.context_encoder
+        device = img.device
+
+        # Patch embedding + positional encoding (same as VisionTransformer.forward)
+        x = vt.to_patch_embedding(img)  # (B, N, D)
+        x = x + vt.pos_embedding.to(device, dtype=x.dtype)
+
+        depth = len(vt.transformer.layers)
+        gate_values: torch.Tensor | None = None
+        gate_probs: torch.Tensor | None = None
+        gate_mlp_input_example: torch.Tensor | None = None
+
+        for layer_idx, (attn, ff) in enumerate(vt.transformer.layers):
+            if layer_idx != self.gate_layer_index:
+                # Standard transformer block
+                x = attn(x) + x
+                x = ff(x) + x
+                continue
+
+            # ---- Gated block at layer_idx == gate_layer_index ----
+            if self.gate_location == "attn":
+                # Gate on raw attention output before residual
+                attn_out = attn(x)  # (B, N, D)
+                gate_mlp_input = attn_out
+
+                log_alpha = self.gate_mlp(gate_mlp_input).squeeze(-1)  # (B, N)
+                log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+
+                gate_values, gate_probs = self.gate(
+                    log_alpha,
+                    training=self.training,
+                )  # (B, N), (B, N)
+
+                B, N, D = attn_out.shape
+                mask_token = self.mask_token.to(device)          # (1, D)
+                mask_tokens = mask_token.expand(B, N, D)         # (B, N, D)
+
+                r = gate_values.unsqueeze(-1)                    # (B, N, 1)
+                one_minus_r = 1.0 - r                            # (B, N, 1)
+
+                attn_out_gated = r * attn_out + one_minus_r * mask_tokens
+                x = attn_out_gated + x                           # residual
+                x = ff(x) + x                                    # FFN + residual
+
+            elif self.gate_location == "skip":
+                # Gate after attention+skip, before FFN
+                attn_out = attn(x)                    # (B, N, D)
+                x_skip = attn_out + x                 # (B, N, D)
+                gate_mlp_input = x_skip
+
+                log_alpha = self.gate_mlp(gate_mlp_input).squeeze(-1)  # (B, N)
+                log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+
+                gate_values, gate_probs = self.gate(
+                    log_alpha,
+                    training=self.training,
+                )  # (B, N), (B, N)
+
+                B, N, D = x_skip.shape
+                mask_token = self.mask_token.to(device)          # (1, D)
+                mask_tokens = mask_token.expand(B, N, D)         # (B, N, D)
+
+                r = gate_values.unsqueeze(-1)                    # (B, N, 1)
+                one_minus_r = 1.0 - r                            # (B, N, 1)
+
+                x_gated = r * x_skip + one_minus_r * mask_tokens
+                x = ff(x_gated) + x_gated                        # FFN + residual
+
+            else:  # self.gate_location == "post"
+                # Standard block, then gate on full block output
+                x = attn(x) + x
+                x = ff(x) + x
+                gate_mlp_input = x
+
+                log_alpha = self.gate_mlp(gate_mlp_input).squeeze(-1)  # (B, N)
+                log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+
+                gate_values, gate_probs = self.gate(
+                    log_alpha,
+                    training=self.training,
+                )  # (B, N), (B, N)
+
+                B, N, D = x.shape
+                mask_token = self.mask_token.to(device)          # (1, D)
+                mask_tokens = mask_token.expand(B, N, D)         # (B, N, D)
+
+                r = gate_values.unsqueeze(-1)                    # (B, N, 1)
+                one_minus_r = 1.0 - r                            # (B, N, 1)
+
+                x = r * x + one_minus_r * mask_tokens            # (B, N, D)
+
+            # whatever gate_mlp_input we used, keep one example for observability
+            gate_mlp_input_example = gate_mlp_input[0].detach()  # (N, D)
+
+        # Final LayerNorm of the transformer
+        x = vt.transformer.norm(x)                               # (B, N, D)
+
+        if gate_values is None or gate_probs is None or gate_mlp_input_example is None:
+            raise RuntimeError(
+                "Internal gating requested but gate_layer_index was never hit."
+            )
+
+        return x, gate_values, gate_probs, gate_mlp_input_example
+
 
     def forward(
         self,
@@ -176,60 +358,69 @@ class GatedIJEPA(BaseIJEPA):
                 * "closed_frac_per_sample"
                 * "gate_map_example"
                 * "gate_values_full"
+                * "gate_mlp_input_example"  # (N, D) tokens fed to gate_mlp
         """
         device = img.device
 
         # -------------------------
         # 1. Teacher / target path
         # -------------------------
-        # Uses EMA target encoder + LayerNorm from BaseIJEPA._encode_teacher
         with torch.no_grad():
             target_features = self._encode_teacher(img)  # (B, N, D)
 
         B, N, D = target_features.shape
 
         # -------------------------
-        # 2. Student embeddings
+        # 2. Student path + gating location logic
         # -------------------------
-        # context_encoder processes the full image, no manual masking here.
-        student_tokens = self.context_encoder(img)  # (B, N, D)
+        depth = len(self.context_encoder.transformer.layers)
+        use_internal_gating = (
+            self.gate_layer_index is not None
+            and 0 <= self.gate_layer_index < depth
+        )
+
+        if use_internal_gating:
+            # Gating happens inside the encoder after block gate_layer_index.
+            # Remaining blocks see masked tokens. Predictor sees final masked tokens.
+            (
+                student_tokens,
+                gate_values,
+                gate_probs,
+                gate_mlp_input_example,
+            ) = self._encode_student_with_internal_gating(img)
+            context_tokens = student_tokens  # already masked by encoder
+
+        else:
+            # Original behavior: context encoder sees full image;
+            # gating only affects predictor input (post-encoder).
+            student_tokens = self.context_encoder(img)          # (B, N, D)
+
+            # Gate MLP input in this case is simply the final student tokens
+            gate_mlp_input = student_tokens                    # (B, N, D)
+
+            log_alpha = self.gate_mlp(gate_mlp_input).squeeze(-1)  # (B, N)
+            log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+
+            gate_values, gate_probs = self.gate(
+                log_alpha,
+                training=self.training,
+            )  # (B, N), (B, N)
+
+            B, N, D = student_tokens.shape
+            mask_token = self.mask_token.to(device)             # (1, D)
+            mask_tokens = mask_token.expand(B, N, D)            # (B, N, D)
+
+            r = gate_values.unsqueeze(-1)                       # (B, N, 1)
+            one_minus_r = 1.0 - r                               # (B, N, 1)
+
+            context_tokens = r * student_tokens + one_minus_r * mask_tokens
+
+            # Example for SSIM observability
+            gate_mlp_input_example = gate_mlp_input[0].detach()  # (N, D)
 
         # -------------------------
-        # 3. Gating over tokens
+        # 3. Predictor
         # -------------------------
-        # gate_mlp produces a scalar log_alpha per token:
-        #   log α_{b,i} ∈ R
-        log_alpha = self.gate_mlp(student_tokens).squeeze(-1)  # (B, N)
-        # Clamp for numerical stability
-        log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
-
-        # r ∈ [0, 1] are the actual gate samples (differentiable during training);
-        # gate_probs ∈ (0,1) are the open probabilities P(r > 0) used for
-        # the gate usage penalty.
-        gate_values, gate_probs = self.gate(
-            log_alpha,
-            training=self.training,
-        )  # (B, N), (B, N)
-
-        # -------------------------
-        # 4. Build masked input C
-        # -------------------------
-        # For each token i:
-        #   c_i = r_i * z^{(S)}_i + (1 - r_i) * m
-        # where m is a learned mask token shared across positions.
-        mask_token = self.mask_token.to(device)          # (1, D)
-        mask_tokens = mask_token.expand(B, N, D)         # (B, N, D)
-
-        r = gate_values.unsqueeze(-1)                    # (B, N, 1)
-        one_minus_r = 1.0 - r                            # (B, N, 1)
-
-        context_tokens = r * student_tokens + one_minus_r * mask_tokens
-        # context_tokens: (B, N, D)
-
-        # -------------------------
-        # 5. Predictor
-        # -------------------------
-        # Predictor operates on tokens directly (no patchify, no extra pos emb).
         predictor_output = self.predictor(
             context_tokens,
             patchify=False,
@@ -241,30 +432,15 @@ class GatedIJEPA(BaseIJEPA):
         )
 
         # -------------------------
-        # 6. Prediction loss on all tokens
+        # 4. Prediction loss on all tokens
         # -------------------------
-        # Gates only affect the *input* to the predictor (context_tokens).
-        # Every token's prediction error contributes to the loss.
         diff = predictor_output - target_features         # (B, N, D)
         sq_norm = (diff ** 2).sum(dim=-1)                 # (B, N)
-
         pred_loss = sq_norm.mean()                        # scalar
 
         # -------------------------
-        # 7. Gate sparsity penalty (normalized + exponential)
+        # 5. Gate sparsity penalty (normalized + exponential)
         # -------------------------
-        # gate_probs_{b,i} ≈ P(r_{b,i} > 0) => "open gate" probability.
-        #
-        # Per-sample expected fraction of open gates:
-        #
-        #   f_b = (1 / N) * ∑_i gate_probs_{b,i} ∈ [0, 1]
-        #
-        # Exponential penalty:
-        #
-        #   p_b = exp(α · f_b) - 1
-        #
-        # L_gates = (1 / B) ∑_b p_b
-        # L_total = L_pred + λ_gates · L_gates
         open_frac_per_sample = gate_probs.mean(dim=1)         # (B,)
         gate_penalty_per_sample = torch.exp(
             self.gate_exp_alpha * open_frac_per_sample
@@ -274,23 +450,15 @@ class GatedIJEPA(BaseIJEPA):
         total_loss = pred_loss + self.lambda_gates * gate_penalty
 
         # -------------------------
-        # 8. Observability stats
+        # 6. Observability stats
         # -------------------------
-        # Mean open probability over all tokens in batch
         open_prob_mean = gate_probs.mean()                     # scalar
         closed_prob_mean = 1.0 - open_prob_mean
-
-        # Per-sample expected open / closed fractions
-        open_frac_per_sample = gate_probs.mean(dim=1)          # (B,)
         closed_frac_per_sample = 1.0 - open_frac_per_sample    # (B,)
 
-        # Example gate map (for logging / visualization): choose a
-        # representative sample (e.g. index 0) and reshape to
-        # (H_p, W_p) with H_p * W_p = N.
         H_p = self.num_patches_per_dim
         W_p = self.num_patches_per_dim
         if H_p * W_p != N:
-            # Fallback: just keep a 1D vector if shape mismatch
             gate_map_example = gate_values[0].detach()
         else:
             gate_map_example = gate_values[0].detach().view(H_p, W_p)
@@ -302,9 +470,10 @@ class GatedIJEPA(BaseIJEPA):
             "closed_prob_mean": closed_prob_mean.detach(),
             "open_frac_per_sample": open_frac_per_sample.detach(),
             "closed_frac_per_sample": closed_frac_per_sample.detach(),
-            "gate_map_example": gate_map_example,         # (H_p, W_p) or (N,)
-            # Full gate values for the whole batch (B, N)
+            "gate_map_example": gate_map_example,
             "gate_values_full": gate_values.detach(),
+            "gate_mlp_input_example": gate_mlp_input_example,  # (N, D)
         }
 
         return total_loss, stats
+
