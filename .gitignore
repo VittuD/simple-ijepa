@@ -163,6 +163,7 @@ cython_debug/
 
 # Misc
 .vscode
+.secrets
 logs
 data
 experiments
@@ -170,3 +171,4 @@ models
 notebooks
 images
 outputs
+wandb

@@ -50,6 +50,21 @@ class LoggingConfig:
     log_every_n_steps: int = 98
     ckpt_path: Optional[str] = None
 
+    # --- W&B integration ---
+    # If True, rank 0 will initialize a Weights & Biases run and log metrics.
+    use_wandb: bool = True
+
+    # W&B project name (e.g. "ijepa_gate_loss").
+    wandb_project: Optional[str] = "ijepa_gate_loss"
+
+    # W&B entity (your username or team name), e.g. "vitturini-davide".
+    wandb_entity: Optional[str] = "vitturini-davide"
+
+    # Optional custom run name. If None, we auto-generate a slug.
+    wandb_run_name: Optional[str] = None
+
+    # Path to a text file that contains the W&B API key (single line).
+    wandb_api_key_file: Optional[str] = ".secrets"
 
 @dataclass
 class DebugConfig:

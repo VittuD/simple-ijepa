@@ -26,6 +26,7 @@ from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
 from simple_ijepa.config import TrainConfig
 from simple_ijepa.configuration_ijepa import IJEPAConfig
+from simple_ijepa.training.wandb_utils import init_wandb, log_metrics
 from simple_ijepa.training.dist_utils import (
     maybe_run_eval,
     prepare_paths,
@@ -235,6 +236,9 @@ class IJEPATrainerDDP:
         # Process-aware logger (console + file)
         logger = setup_logging(self.cfg, rank)
 
+        # Initialize W&B (only on rank 0; returns None otherwise)
+        wandb_run = init_wandb(cfg, rank=rank, world_size=world_size, logger=logger)
+
         device = torch.device("cuda", local_rank)
         model_cfg = self.cfg.model
 
@@ -272,6 +276,7 @@ class IJEPATrainerDDP:
                 image_size=model_cfg.image_size,
                 dataset_path=cfg.data.dataset_path,
                 logger=logger,
+                wandb_run=wandb_run,
             )
             if rank == 0
             else None
@@ -432,6 +437,16 @@ class IJEPATrainerDDP:
                             f"EMA gamma: {gamma:.6f} | "
                             f"Lr: {current_lr:.6f}"
                         )
+
+                        metrics = {
+                            "train/epoch": epoch + 1,
+                            "train/global_step": global_step + 1,
+                            "train/loss_step": loss_value,
+                            "train/loss_epoch": ep_loss,
+                            "train/loss_avg": avg_loss,
+                            "train/ema_gamma": gamma,
+                            "train/lr": current_lr,
+                        }
                     else:
                         pred_loss = stats["pred_loss"].item()
                         gate_penalty = stats["gate_penalty"].item()
@@ -451,10 +466,27 @@ class IJEPATrainerDDP:
                             f"Lr: {current_lr:.6f}"
                         )
 
+                        metrics = {
+                            "train/epoch": epoch + 1,
+                            "train/global_step": global_step + 1,
+                            "train/loss_step": loss_value,
+                            "train/loss_epoch": ep_loss,
+                            "train/loss_avg": avg_loss,
+                            "train/ema_gamma": gamma,
+                            "train/lr": current_lr,
+                            "gates/pred_loss": pred_loss,
+                            "gates/gate_penalty": gate_penalty,
+                            "gates/open_prob_mean": open_prob_mean,
+                            "gates/closed_prob_mean": closed_prob_mean,
+                        }
+
                     # Show progress in-place on console
                     progress_bar.set_description(desc)
                     # Log per-step line at DEBUG level -> only file, not console
                     logger.debug(desc)
+
+                    # Log to W&B (no-op if wandb_run is None)
+                    log_metrics(wandb_run, metrics, step=global_step + 1)
 
                 global_step += 1
 
@@ -484,5 +516,12 @@ class IJEPATrainerDDP:
 
         if rank == 0:
             logger.info("Training completed.")
+            if wandb_run is not None:
+                try:
+                    import wandb  # type: ignore
+                    wandb_run.finish()
+                except Exception:
+                    logger.warning("Failed to properly finish W&B run.", exc_info=False)
 
         dist.destroy_process_group()
+

@@ -37,15 +37,18 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def prepare_paths(cfg: TrainConfig) -> TrainConfig:
-    """
-    Make dataset & model dirs relative to the original project root,
-    not Hydra's per-run working directory.
-    """
     root = get_original_cwd()
     if not os.path.isabs(cfg.data.dataset_path):
         cfg.data.dataset_path = os.path.join(root, cfg.data.dataset_path)
     if not os.path.isabs(cfg.logging.save_model_dir):
         cfg.logging.save_model_dir = os.path.join(root, cfg.logging.save_model_dir)
+
+    if cfg.logging.wandb_api_key_file and not os.path.isabs(cfg.logging.wandb_api_key_file):
+        cfg.logging.wandb_api_key_file = os.path.join(
+            root,
+            cfg.logging.wandb_api_key_file,
+        )
+
     return cfg
 
 
@@ -144,24 +147,40 @@ def maybe_run_eval(
     if cfg.variant == "baseline":
         # Standard path: use teacher encoder as in original code
         _log("Evaluating STL10 with teacher encoder...")
-        stl10_eval.evaluate(ddp_model.module)
+        stl10_eval.evaluate(
+            ddp_model.module,
+            global_step=global_step,
+            prefix="eval/teacher",
+        )
 
         # Comparable alternative: use student encoder
         _log("Evaluating STL10 with student encoder...")
-        stl10_eval.evaluate(EncoderAsIJEPA(ddp_model.module.context_encoder))
+        stl10_eval.evaluate(
+            EncoderAsIJEPA(ddp_model.module.context_encoder),
+            global_step=global_step,
+            prefix="eval/student",
+        )
     else:
         # Reuse STL10Eval by wrapping custom encoders
         _log("Evaluating STL10 with student + learned gates...")
         gated_encoder = GatedPredictorEncoder(ddp_model.module, mode="gated").to(
             stl10_eval.device
         )
-        stl10_eval.evaluate(EncoderAsIJEPA(gated_encoder))
+        stl10_eval.evaluate(
+            EncoderAsIJEPA(gated_encoder),
+            global_step=global_step,
+            prefix="eval/gated",
+        )
 
         _log("Evaluating STL10 with student + all gates open...")
         all_open_encoder = GatedPredictorEncoder(
             ddp_model.module, mode="all_open"
         ).to(stl10_eval.device)
-        stl10_eval.evaluate(EncoderAsIJEPA(all_open_encoder))
+        stl10_eval.evaluate(
+            EncoderAsIJEPA(all_open_encoder),
+            global_step=global_step,
+            prefix="eval/all_open",
+        )
 
     _log("Finished STL10 evaluation pass.")
 

@@ -34,6 +34,7 @@ setup(
         'tqdm>=4.66',
         'torchinfo>=1.8.0',
         'hydra-core>=1.3.2',
+        'wandb>=0.23.0',
     ],
     classifiers=[
         'Development Status :: 4 - Beta',
