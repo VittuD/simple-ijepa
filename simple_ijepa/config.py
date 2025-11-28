@@ -47,6 +47,11 @@ class TrainConfig:
     # once per epoch (first step) using save_debug_masks().
     save_debug_masks: bool = False
 
+    def __post_init__(self):
+        # Avoid mutable defaults by instantiating a fresh model config when None
+        if self.model is None:
+            self.model = IJEPAConfig()
+
 
 cs = ConfigStore.instance()
 cs.store(name="train_config", node=TrainConfig)
