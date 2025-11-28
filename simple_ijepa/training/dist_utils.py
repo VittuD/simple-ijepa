@@ -41,10 +41,10 @@ def prepare_paths(cfg: TrainConfig) -> TrainConfig:
     not Hydra's per-run working directory.
     """
     root = get_original_cwd()
-    if not os.path.isabs(cfg.dataset_path):
-        cfg.dataset_path = os.path.join(root, cfg.dataset_path)
-    if not os.path.isabs(cfg.save_model_dir):
-        cfg.save_model_dir = os.path.join(root, cfg.save_model_dir)
+    if not os.path.isabs(cfg.data.dataset_path):
+        cfg.data.dataset_path = os.path.join(root, cfg.data.dataset_path)
+    if not os.path.isabs(cfg.logging.save_model_dir):
+        cfg.logging.save_model_dir = os.path.join(root, cfg.logging.save_model_dir)
     return cfg
 
 

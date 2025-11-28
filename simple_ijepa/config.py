@@ -8,47 +8,83 @@ from hydra.core.config_store import ConfigStore
 from simple_ijepa.configuration_ijepa import IJEPAConfig
 
 
+# ------------------------------------------------------------------
+# Sub-configs
+# ------------------------------------------------------------------
+
 @dataclass
-class TrainConfig:
-    # which variant: "baseline" or "gated"
-    variant: str = "baseline"
-
-    # model architecture
-    model: IJEPAConfig = IJEPAConfig()
-
-    # data
+class DataConfig:
+    # dataset selection
     dataset_path: str = "./data"
     dataset_name: str = "stl10"
 
-    # output
-    save_model_dir: str = "./models"
 
-    # training
+@dataclass
+class OptimConfig:
+    # optimization / training loop
     num_epochs: int = 100
-    batch_size: int = 1024
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
     fp16_precision: bool = True
 
-    # logging / ckpt
-    log_every_n_steps: int = 98
-    ckpt_path: Optional[str] = None
 
-    # EMA
+@dataclass
+class DataloaderConfig:
+    # dataloader-related knobs
+    batch_size: int = 1024
+    num_workers: int = 8
+
+
+@dataclass
+class EMAConfig:
+    # EMA teacher update
     gamma: float = 0.996
     update_gamma_after_step: int = 1
     update_gamma_every_n_steps: int = 1
 
-    # dataloader
-    num_workers: int = 8
 
+@dataclass
+class LoggingConfig:
+    # logging / checkpointing / output dirs
+    save_model_dir: str = "./models"
+    log_every_n_steps: int = 98
+    ckpt_path: Optional[str] = None
+
+
+@dataclass
+class DebugConfig:
     # debugging / visualization
     # If True and variant == "gated", rank 0 saves mask visualizations
     # once per epoch (first step) using save_debug_masks().
     save_debug_masks: bool = False
 
+
+# ------------------------------------------------------------------
+# Root experiment config
+# ------------------------------------------------------------------
+
+@dataclass
+class TrainConfig:
+    """
+    Root Hydra config with structured sub-sections.
+    """
+
+    # which variant: "baseline" or "gated"
+    variant: str = "baseline"
+
+    # model architecture + gating
+    model: IJEPAConfig = field(default_factory=IJEPAConfig)
+
+    # structured sub-configs
+    data: DataConfig = field(default_factory=DataConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
+    ema: EMAConfig = field(default_factory=EMAConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
+
     def __post_init__(self):
-        # Avoid mutable defaults by instantiating a fresh model config when None
+        # Still safe-guard if Hydra or overrides set model=None
         if self.model is None:
             self.model = IJEPAConfig()
 

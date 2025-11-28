@@ -80,10 +80,10 @@ class IJEPATrainerDDP:
                 predictor_heads=model_cfg.predictor_heads,
             )
 
-            if cfg.ckpt_path is not None:
+            if cfg.logging.ckpt_path is not None:
                 if rank == 0:
-                    print(f"Loading baseline checkpoint from {cfg.ckpt_path}")
-                state = torch.load(cfg.ckpt_path, map_location=map_location)
+                    print(f"Loading baseline checkpoint from {cfg.logging.ckpt_path}")
+                state = torch.load(cfg.logging.ckpt_path, map_location=map_location)
                 model.load_state_dict(state)
 
             model = model.to(device)
@@ -95,8 +95,8 @@ class IJEPATrainerDDP:
             )
             optimizer = torch.optim.Adam(
                 params,
-                lr=cfg.learning_rate,
-                weight_decay=cfg.weight_decay,
+                lr=cfg.optim.learning_rate,
+                weight_decay=cfg.optim.weight_decay,
             )
 
             training_ckpt_name = "training_model_ddp.pth"
@@ -111,23 +111,26 @@ class IJEPATrainerDDP:
                 predictor_depth=model_cfg.predictor_depth,
                 predictor_heads=model_cfg.predictor_heads,
                 lambda_gates=model_cfg.lambda_gates,
+                gate_beta=model_cfg.gate_beta,
+                gate_gamma=model_cfg.gate_gamma,
+                gate_zeta=model_cfg.gate_zeta,
                 gate_exp_alpha=model_cfg.gate_exp_alpha,
                 gate_layer_index=model_cfg.gate_layer_index,
                 gate_location=model_cfg.gate_location,
             )
 
-            if cfg.ckpt_path is not None:
+            if cfg.logging.ckpt_path is not None:
                 if rank == 0:
-                    print(f"Loading gated checkpoint from {cfg.ckpt_path}")
-                state = torch.load(cfg.ckpt_path, map_location=map_location)
+                    print(f"Loading gated checkpoint from {cfg.logging.ckpt_path}")
+                state = torch.load(cfg.logging.ckpt_path, map_location=map_location)
                 model.load_state_dict(state)
 
             model = model.to(device)
 
             optimizer = torch.optim.AdamW(
                 model.parameters(),
-                lr=cfg.learning_rate,
-                weight_decay=cfg.weight_decay,
+                lr=cfg.optim.learning_rate,
+                weight_decay=cfg.optim.weight_decay,
             )
 
             training_ckpt_name = "training_model_gated_ddp.pth"
@@ -145,14 +148,16 @@ class IJEPATrainerDDP:
         Create STL10-based training dataset and DDP-aware DataLoader.
         """
         cfg = self.cfg
-        if cfg.dataset_name != "stl10":
+        if cfg.data.dataset_name != "stl10":
             raise ValueError("Only STL10 is supported in this implementation.")
 
         base_ds = STL10(
-            cfg.dataset_path,
+            cfg.data.dataset_path,
             split="unlabeled",
             download=(rank == 0),
-            transform=training_transforms((model_cfg.image_size, model_cfg.image_size)),
+            transform=training_transforms(
+                (model_cfg.image_size, model_cfg.image_size)
+            ),
         )
 
         # Ensure all ranks wait until data is ready
@@ -178,9 +183,9 @@ class IJEPATrainerDDP:
 
         loader_kwargs = dict(
             dataset=dataset,
-            batch_size=cfg.batch_size,
+            batch_size=cfg.dataloader.batch_size,
             sampler=train_sampler,
-            num_workers=cfg.num_workers,
+            num_workers=cfg.dataloader.num_workers,
             pin_memory=True,
         )
         if cfg.variant == "baseline":
@@ -251,17 +256,17 @@ class IJEPATrainerDDP:
             rank=rank,
         )
 
-        scaler = GradScaler(enabled=cfg.fp16_precision)
+        scaler = GradScaler(enabled=cfg.optim.fp16_precision)
 
         # Only rank 0 will run linear probing evals & print accuracy
         stl10_eval = (
-            STL10Eval(image_size=model_cfg.image_size, dataset_path=cfg.dataset_path)
+            STL10Eval(image_size=model_cfg.image_size, dataset_path=cfg.data.dataset_path)
             if rank == 0
             else None
         )
 
-        total_num_steps = (len(train_loader) * (cfg.num_epochs + 2)) - cfg.update_gamma_after_step
-        gamma = cfg.gamma
+        total_num_steps = (len(train_loader) * (cfg.optim.num_epochs + 2)) - cfg.ema.update_gamma_after_step
+        gamma = cfg.ema.gamma
         global_step = 0
         total_loss = 0.0
 
@@ -269,8 +274,8 @@ class IJEPATrainerDDP:
             variant_str = "baseline I-JEPA" if cfg.variant == "baseline" else "Gated I-JEPA"
             print(
                 f"Starting DDP training ({variant_str}) with {world_size} GPUs, "
-                f"per-GPU batch size {cfg.batch_size}, "
-                f"effective global batch size {cfg.batch_size * world_size}"
+                f"per-GPU batch size {cfg.dataloader.batch_size}, "
+                f"effective global batch size {cfg.dataloader.batch_size * world_size}"
             )
             if cfg.variant == "gated":
                 print(
@@ -283,14 +288,14 @@ class IJEPATrainerDDP:
         # ----------------------------
         # Training loop
         # ----------------------------
-        for epoch in range(cfg.num_epochs):
+        for epoch in range(cfg.optim.num_epochs):
             train_sampler.set_epoch(epoch)
             epoch_loss = 0.0
 
             if rank == 0:
                 progress_bar = tqdm(
                     train_loader,
-                    desc=f"Epoch {epoch + 1}/{cfg.num_epochs}",
+                    desc=f"Epoch {epoch + 1}/{cfg.optim.num_epochs}",
                     leave=True,
                 )
             else:
@@ -298,7 +303,7 @@ class IJEPATrainerDDP:
 
             for step, batch in enumerate(progress_bar):
                 loss, stats, images = self._forward_batch(
-                    ddp_model, batch, device, cfg.fp16_precision
+                    ddp_model, batch, device, cfg.optim.fp16_precision
                 )
 
                 # ------------------------------------------------------
@@ -310,7 +315,7 @@ class IJEPATrainerDDP:
                 # ------------------------------------------------------
                 if (
                     cfg.variant == "gated"
-                    and cfg.save_debug_masks
+                    and cfg.debug.save_debug_masks
                     and rank == 0
                     and isinstance(stats, dict)
                 ):
@@ -322,7 +327,7 @@ class IJEPATrainerDDP:
                                 gate_values_full=stats["gate_values_full"],
                                 epoch=epoch,
                                 global_step=global_step,
-                                save_root=cfg.save_model_dir,
+                                save_root=cfg.logging.save_model_dir,
                                 image_size=model_cfg.image_size,
                                 patch_size=model_cfg.patch_size,
                                 max_images=8,
@@ -333,11 +338,12 @@ class IJEPATrainerDDP:
                     # 2) SSIM on gate_mlp input (only first batch of run)
                     if step == 0 and "gate_mlp_input_example" in stats:
                         try:
-                            # gate_mlp_input_example: (N, D) token embeddings
                             tokens = stats["gate_mlp_input_example"]  # (N, D)
                             ssim_mat = compute_token_ssim_matrix(tokens)
 
-                            debug_dir = os.path.join(cfg.save_model_dir, "debug_ssim")
+                            debug_dir = os.path.join(
+                                cfg.logging.save_model_dir, "debug_ssim"
+                            )
                             os.makedirs(debug_dir, exist_ok=True)
 
                             step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
@@ -367,13 +373,13 @@ class IJEPATrainerDDP:
 
                 # EMA update
                 if (
-                    global_step > cfg.update_gamma_after_step
-                    and global_step % cfg.update_gamma_every_n_steps == 0
+                    global_step > cfg.ema.update_gamma_after_step
+                    and global_step % cfg.ema.update_gamma_every_n_steps == 0
                 ):
                     ddp_model.module.update_params(gamma)
-                    gamma = update_gamma(global_step, total_num_steps, cfg.gamma)
+                    gamma = update_gamma(global_step, total_num_steps, cfg.ema.gamma)
 
-                if global_step <= cfg.update_gamma_after_step:
+                if global_step <= cfg.ema.update_gamma_after_step:
                     ddp_model.module.copy_params()
 
                 # Stats & logging
@@ -389,7 +395,7 @@ class IJEPATrainerDDP:
 
                     if cfg.variant == "baseline":
                         desc = (
-                            f"Epoch {epoch+1}/{cfg.num_epochs} | "
+                            f"Epoch {epoch+1}/{cfg.optim.num_epochs} | "
                             f"Step {global_step+1} | "
                             f"Epoch Loss: {ep_loss:.7f} | "
                             f"Total Loss: {avg_loss:.7f} | "
@@ -403,7 +409,7 @@ class IJEPATrainerDDP:
                         closed_prob_mean = stats["closed_prob_mean"].item()
 
                         desc = (
-                            f"Epoch {epoch+1}/{cfg.num_epochs} | "
+                            f"Epoch {epoch+1}/{cfg.optim.num_epochs} | "
                             f"Step {global_step+1} | "
                             f"EpLoss: {ep_loss:.4f} | "
                             f"TotLoss: {avg_loss:.4f} | "
@@ -420,10 +426,10 @@ class IJEPATrainerDDP:
                 global_step += 1
 
                 # Checkpointing & eval only on rank 0
-                if rank == 0 and global_step % cfg.log_every_n_steps == 0:
+                if rank == 0 and global_step % cfg.logging.log_every_n_steps == 0:
                     save_checkpoint(
                         ddp_model,
-                        cfg.save_model_dir,
+                        cfg.logging.save_model_dir,
                         training_ckpt_name,
                         encoder_ckpt_name,
                     )
@@ -432,7 +438,7 @@ class IJEPATrainerDDP:
                     cfg,
                     rank,
                     global_step,
-                    cfg.log_every_n_steps,
+                    cfg.logging.log_every_n_steps,
                     stl10_eval,
                     ddp_model,
                 )
