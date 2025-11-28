@@ -323,8 +323,8 @@ class IJEPATrainerDDP:
                                 epoch=epoch,
                                 global_step=global_step,
                                 save_root=cfg.save_model_dir,
-                                image_size=image_size,
-                                patch_size=patch_size,
+                                image_size=model_cfg.image_size,
+                                patch_size=model_cfg.patch_size,
                                 max_images=8,
                             )
                         except Exception as e:

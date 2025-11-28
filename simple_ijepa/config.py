@@ -1,6 +1,6 @@
 # simple_ijepa/config.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from hydra.core.config_store import ConfigStore
