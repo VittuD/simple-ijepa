@@ -11,12 +11,12 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 from torchvision.datasets import STL10
 
-from train import update_gamma
 from simple_ijepa.transformer import VisionTransformer
 from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.ijepa_gated import GatedIJEPA
 from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import (
+    update_gamma,
     training_transforms,
     save_debug_masks,
     compute_token_ssim_matrix,
