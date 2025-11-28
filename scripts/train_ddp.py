@@ -4,7 +4,7 @@ from simple_ijepa.config import TrainConfig
 from simple_ijepa.training.ddp_trainer import IJEPATrainerDDP
 
 
-@hydra.main(version_base=None, config_path=None, config_name="train_config")
+@hydra.main(version_base=None, config_name="train_config")
 def main(cfg: TrainConfig) -> None:
     trainer = IJEPATrainerDDP(cfg)
     trainer.train()
