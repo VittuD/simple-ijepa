@@ -1,5 +1,8 @@
 # simple_ijepa/stl10_eval.py
 
+import logging
+from typing import Optional
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -16,7 +19,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-def logistic_regression(embeddings, labels, embeddings_val, labels_val):
+def logistic_regression(
+    embeddings,
+    labels,
+    embeddings_val,
+    labels_val,
+    logger: Optional[logging.Logger] = None,
+):
     X_train, X_test = embeddings, embeddings_val
     y_train, y_test = labels, labels_val
 
@@ -27,25 +36,38 @@ def logistic_regression(embeddings, labels, embeddings_val, labels_val):
 
     y_pred = clf.predict(X_test)
 
+    if logger is None:
+        logger = logging.getLogger("simple_ijepa.stl10_eval")
+
     acc = accuracy_score(y_test, y_pred)
-    print("Accuracy STL10: ", acc)
+    logger.info("Accuracy STL10: %.4f", acc)
 
 
 class STL10Eval:
-
-    def __init__(self, image_size=96, dataset_path="data/"):
+    def __init__(
+        self,
+        image_size: int = 96,
+        dataset_path: str = "data/",
+        logger: Optional[logging.Logger] = None,
+    ):
         self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.logger = logger or logging.getLogger("simple_ijepa.stl10_eval")
 
         transform = inference_transforms(img_size=(image_size, image_size))
-        train_ds = torchvision.datasets.STL10(root=dataset_path,
-                                              split='train',
-                                              transform=transform,
-                                              download=True)
-        val_ds = torchvision.datasets.STL10(root=dataset_path,
-                                            split='test',
-                                            transform=transform,
-                                            download=True)
+        train_ds = torchvision.datasets.STL10(
+            root=dataset_path,
+            split="train",
+            transform=transform,
+            download=True,
+        )
+        val_ds = torchvision.datasets.STL10(
+            root=dataset_path,
+            split="test",
+            transform=transform,
+            download=True,
+        )
 
         self.train_loader = DataLoader(train_ds, batch_size=64, num_workers=2)
         self.val_loader = DataLoader(val_ds, batch_size=64, num_workers=2)
@@ -55,10 +77,18 @@ class STL10Eval:
         model = ijepa_model.target_encoder
         # model = ijepa_model.context_encoder
         embeddings, labels = self._get_image_embs_labels(
-            model, self.train_loader)
+            model, self.train_loader
+        )
         embeddings_val, labels_val = self._get_image_embs_labels(
-            model, self.val_loader)
-        logistic_regression(embeddings, labels, embeddings_val, labels_val)
+            model, self.val_loader
+        )
+        logistic_regression(
+            embeddings,
+            labels,
+            embeddings_val,
+            labels_val,
+            logger=self.logger,
+        )
 
     @torch.inference_mode
     def _get_image_embs_labels(self, model, dataloader):

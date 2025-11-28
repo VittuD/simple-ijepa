@@ -1,3 +1,5 @@
+# simple_ijepa/simple_ijepa/training/ddp_trainer.py
+
 import os
 from typing import Tuple
 
@@ -30,6 +32,7 @@ from simple_ijepa.training.dist_utils import (
     save_checkpoint,
     set_seed,
     setup_distributed,
+    setup_logging,
 )
 
 
@@ -46,6 +49,7 @@ class IJEPATrainerDDP:
         local_rank: int,
         rank: int,
         model_cfg: IJEPAConfig,
+        logger,
     ) -> Tuple[torch.nn.Module, torch.optim.Optimizer, str, str]:
         """
         Build the encoder + IJEPA or GatedIJEPA model, load an optional checkpoint,
@@ -80,9 +84,9 @@ class IJEPATrainerDDP:
                 predictor_heads=model_cfg.predictor_heads,
             )
 
-            if cfg.logging.ckpt_path is not None:
-                if rank == 0:
-                    print(f"Loading baseline checkpoint from {cfg.logging.ckpt_path}")
+            if cfg.logging.ckpt_path is not None and rank == 0:
+                msg = f"Loading baseline checkpoint from {cfg.logging.ckpt_path}"
+                logger.info(msg)
                 state = torch.load(cfg.logging.ckpt_path, map_location=map_location)
                 model.load_state_dict(state)
 
@@ -119,9 +123,9 @@ class IJEPATrainerDDP:
                 gate_location=model_cfg.gate_location,
             )
 
-            if cfg.logging.ckpt_path is not None:
-                if rank == 0:
-                    print(f"Loading gated checkpoint from {cfg.logging.ckpt_path}")
+            if cfg.logging.ckpt_path is not None and rank == 0:
+                msg = f"Loading gated checkpoint from {cfg.logging.ckpt_path}"
+                logger.info(msg)
                 state = torch.load(cfg.logging.ckpt_path, map_location=map_location)
                 model.load_state_dict(state)
 
@@ -228,6 +232,9 @@ class IJEPATrainerDDP:
         rank, local_rank, world_size = setup_distributed()
         set_seed(SEED, rank)
 
+        # Process-aware logger (console + file)
+        logger = setup_logging(self.cfg, rank)
+
         device = torch.device("cuda", local_rank)
         model_cfg = self.cfg.model
 
@@ -237,6 +244,7 @@ class IJEPATrainerDDP:
             local_rank,
             rank,
             model_cfg,
+            logger=logger,
         )
 
         # Wrap with DDP AFTER creating the optimizer
@@ -258,9 +266,13 @@ class IJEPATrainerDDP:
 
         scaler = GradScaler(enabled=cfg.optim.fp16_precision)
 
-        # Only rank 0 will run linear probing evals & print accuracy
+        # Only rank 0 will run linear probing evals & log accuracy
         stl10_eval = (
-            STL10Eval(image_size=model_cfg.image_size, dataset_path=cfg.data.dataset_path)
+            STL10Eval(
+                image_size=model_cfg.image_size,
+                dataset_path=cfg.data.dataset_path,
+                logger=logger,
+            )
             if rank == 0
             else None
         )
@@ -272,18 +284,22 @@ class IJEPATrainerDDP:
 
         if rank == 0:
             variant_str = "baseline I-JEPA" if cfg.variant == "baseline" else "Gated I-JEPA"
-            print(
-                f"Starting DDP training ({variant_str}) with {world_size} GPUs, "
-                f"per-GPU batch size {cfg.dataloader.batch_size}, "
-                f"effective global batch size {cfg.dataloader.batch_size * world_size}"
+            logger.info(
+                "Starting DDP training (%s) with %d GPUs, per-GPU batch size %d, "
+                "effective global batch size %d",
+                variant_str,
+                world_size,
+                cfg.dataloader.batch_size,
+                cfg.dataloader.batch_size * world_size,
             )
             if cfg.variant == "gated":
-                print(
-                    f"  lambda_gates = {model_cfg.lambda_gates}, "
-                    f"gate_exp_alpha = {model_cfg.gate_exp_alpha}"
+                logger.info(
+                    "  lambda_gates = %s, gate_exp_alpha = %s",
+                    model_cfg.lambda_gates,
+                    model_cfg.gate_exp_alpha,
                 )
-                print(f"  gate_layer_index = {model_cfg.gate_layer_index}")
-                print(f"  gate_location = {model_cfg.gate_location}")
+                logger.info("  gate_layer_index = %s", model_cfg.gate_layer_index)
+                logger.info("  gate_location = %s", model_cfg.gate_location)
 
         # ----------------------------
         # Training loop
@@ -332,8 +348,14 @@ class IJEPATrainerDDP:
                                 patch_size=model_cfg.patch_size,
                                 max_images=8,
                             )
+                            logger.info(
+                                "Saved debug masks for epoch %d, step %d under %s/debug_masks",
+                                epoch + 1,
+                                global_step + 1,
+                                cfg.logging.save_model_dir,
+                            )
                         except Exception as e:
-                            print(f"[WARN] Failed to save debug masks: {e}")
+                            logger.warning("Failed to save debug masks: %s", e)
 
                     # 2) SSIM on gate_mlp input (only first batch of run)
                     if step == 0 and "gate_mlp_input_example" in stats:
@@ -363,8 +385,16 @@ class IJEPATrainerDDP:
                                     f"{model_cfg.gate_layer_index}, pos {model_cfg.gate_location})"
                                 ),
                             )
+                            logger.info(
+                                "Saved token SSIM debug artifacts for epoch %d, step %d under %s",
+                                epoch + 1,
+                                global_step + 1,
+                                debug_dir,
+                            )
                         except Exception as e:
-                            print(f"[WARN] Failed to compute/save token SSIM: {e}")
+                            logger.warning(
+                                "Failed to compute/save token SSIM: %s", e
+                            )
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -421,7 +451,10 @@ class IJEPATrainerDDP:
                             f"Lr: {current_lr:.6f}"
                         )
 
+                    # Show progress in-place on console
                     progress_bar.set_description(desc)
+                    # Log per-step line at DEBUG level -> only file, not console
+                    logger.debug(desc)
 
                 global_step += 1
 
@@ -433,6 +466,11 @@ class IJEPATrainerDDP:
                         training_ckpt_name,
                         encoder_ckpt_name,
                     )
+                    logger.info(
+                        "Saved checkpoints at step %d to %s",
+                        global_step + 1,
+                        cfg.logging.save_model_dir,
+                    )
 
                 maybe_run_eval(
                     cfg,
@@ -441,9 +479,10 @@ class IJEPATrainerDDP:
                     cfg.logging.log_every_n_steps,
                     stl10_eval,
                     ddp_model,
+                    logger=logger,
                 )
 
         if rank == 0:
-            print("Training completed.")
+            logger.info("Training completed.")
 
         dist.destroy_process_group()

@@ -1,5 +1,6 @@
 import os
 import random
+import logging
 from typing import Optional, Tuple
 
 import numpy as np
@@ -48,6 +49,64 @@ def prepare_paths(cfg: TrainConfig) -> TrainConfig:
     return cfg
 
 
+def setup_logging(cfg: TrainConfig, rank: int) -> logging.Logger:
+    """
+    Configure and return a process-aware logger.
+
+    Rank 0:
+      - logs to stdout (INFO+)
+      - logs to <save_model_dir>/training.log (DEBUG+)
+
+    Other ranks:
+      - logs to <save_model_dir>/training_rank{rank}.log (DEBUG+), no console.
+
+    Console output is always a subset of what’s in the log file.
+    """
+    logger = logging.getLogger("simple_ijepa")
+
+    # Avoid duplicating handlers if called multiple times in the same process
+    if logger.handlers:
+        return logger
+
+    # Allow DEBUG+ on the logger itself; handlers will filter what they emit.
+    logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(levelname)s][%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    os.makedirs(cfg.logging.save_model_dir, exist_ok=True)
+
+    if rank == 0:
+        # Console handler: only INFO and above
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+        # File handler for rank 0: full detail (DEBUG+)
+        log_path = os.path.join(cfg.logging.save_model_dir, "training.log")
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+    else:
+        # Non-zero ranks: log to a separate file, full detail (DEBUG+), no console
+        log_path = os.path.join(
+            cfg.logging.save_model_dir,
+            f"training_rank{rank}.log",
+        )
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    # Don't propagate to root (Hydra may have its own logging config)
+    logger.propagate = False
+    return logger
+
+
 def save_checkpoint(
     ddp_model: DDP,
     save_dir: str,
@@ -68,38 +127,43 @@ def maybe_run_eval(
     log_every_n_steps: int,
     stl10_eval: Optional[STL10Eval],
     ddp_model: DDP,
+    logger: logging.Logger,
 ) -> None:
     """
     Run STL10 evaluation if we are on rank 0 and at the right step.
+    All messages go through the logger so console output is mirrored to logs.
     """
     if rank != 0 or stl10_eval is None:
         return
     if global_step % log_every_n_steps != 0:
         return
 
+    def _log(msg: str) -> None:
+        logger.info(msg)
+
     if cfg.variant == "baseline":
         # Standard path: use teacher encoder as in original code
-        print("Evaluating STL10 with teacher encoder...")
+        _log("Evaluating STL10 with teacher encoder...")
         stl10_eval.evaluate(ddp_model.module)
 
         # Comparable alternative: use student encoder
-        print("Evaluating STL10 with student encoder...")
+        _log("Evaluating STL10 with student encoder...")
         stl10_eval.evaluate(EncoderAsIJEPA(ddp_model.module.context_encoder))
     else:
         # Reuse STL10Eval by wrapping custom encoders
-        print("Evaluating STL10 with student + learned gates...")
+        _log("Evaluating STL10 with student + learned gates...")
         gated_encoder = GatedPredictorEncoder(ddp_model.module, mode="gated").to(
             stl10_eval.device
         )
         stl10_eval.evaluate(EncoderAsIJEPA(gated_encoder))
 
-        print("Evaluating STL10 with student + all gates open...")
+        _log("Evaluating STL10 with student + all gates open...")
         all_open_encoder = GatedPredictorEncoder(
             ddp_model.module, mode="all_open"
         ).to(stl10_eval.device)
         stl10_eval.evaluate(EncoderAsIJEPA(all_open_encoder))
 
-    print("!" * 100)
+    _log("Finished STL10 evaluation pass.")
 
 
 class EncoderAsIJEPA:
