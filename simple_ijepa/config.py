@@ -5,11 +5,16 @@ from typing import Optional
 
 from hydra.core.config_store import ConfigStore
 
+from simple_ijepa.configuration_ijepa import IJEPAConfig
+
 
 @dataclass
 class TrainConfig:
     # which variant: "baseline" or "gated"
     variant: str = "baseline"
+
+    # model architecture
+    model: IJEPAConfig = IJEPAConfig()
 
     # data
     dataset_path: str = "./data"
@@ -25,9 +30,6 @@ class TrainConfig:
     weight_decay: float = 1e-5
     fp16_precision: bool = True
 
-    # (kept for backwards compat even if not used)
-    emb_dim: int = 768
-
     # logging / ckpt
     log_every_n_steps: int = 98
     ckpt_path: Optional[str] = None
@@ -39,21 +41,6 @@ class TrainConfig:
 
     # dataloader
     num_workers: int = 8
-
-    # gated-only: gate penalty strength / shape
-    lambda_gates: float = 1.0
-    gate_exp_alpha: float = 4.0
-
-    # gated-only: where to apply gating in the encoder
-    # None  => gating on final encoder tokens (original behavior)
-    # k>=0  => apply gate after transformer block index k
-    gate_layer_index: Optional[int] = None
-
-    # gated-only: where the gate MLP “lives” around that block
-    # "attn" => after the attention module, before skip connection and FFN
-    # "skip" => after the attention module and skip connection, before the FFN
-    # "post" => after the entire transformer block (attn + FFN + residuals)
-    gate_location: str = "post"            # "attn", "skip", or "post"
 
     # debugging / visualization
     # If True and variant == "gated", rank 0 saves mask visualizations
