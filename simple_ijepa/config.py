@@ -14,7 +14,7 @@ class TrainConfig:
     variant: str = "baseline"
 
     # model architecture
-    model: IJEPAConfig = field(default_factory=IJEPAConfig)
+    model: IJEPAConfig = IJEPAConfig()
 
     # data
     dataset_path: str = "./data"
