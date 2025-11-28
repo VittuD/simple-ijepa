@@ -23,6 +23,7 @@ from simple_ijepa.utils import (
 from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
 from simple_ijepa.config import TrainConfig
+from simple_ijepa.configuration_ijepa import IJEPAConfig
 from simple_ijepa.training.dist_utils import (
     maybe_run_eval,
     prepare_paths,
@@ -44,13 +45,7 @@ class IJEPATrainerDDP:
         device: torch.device,
         local_rank: int,
         rank: int,
-        *,
-        dim: int,
-        image_size: int,
-        patch_size: int,
-        depth: int,
-        heads: int,
-        num_targets: int,
+        model_cfg: IJEPAConfig,
     ) -> Tuple[torch.nn.Module, torch.optim.Optimizer, str, str]:
         """
         Build the encoder + IJEPA or GatedIJEPA model, load an optional checkpoint,
@@ -64,12 +59,12 @@ class IJEPATrainerDDP:
         """
         cfg = self.cfg
         encoder = VisionTransformer(
-            image_size=image_size,
-            patch_size=patch_size,
-            dim=dim,
-            depth=depth,
-            heads=heads,
-            mlp_dim=dim * 2,
+            image_size=model_cfg.image_size,
+            patch_size=model_cfg.patch_size,
+            dim=model_cfg.hidden_dim,
+            depth=model_cfg.depth,
+            heads=model_cfg.heads,
+            mlp_dim=model_cfg.hidden_dim * 2,
         )
 
         map_location = {"cuda:0": f"cuda:{local_rank}"}
@@ -77,9 +72,12 @@ class IJEPATrainerDDP:
         if cfg.variant == "baseline":
             model = IJEPA(
                 encoder,
-                hidden_emb_dim=dim,
-                patch_size=patch_size,
-                num_targets=num_targets,
+                hidden_emb_dim=model_cfg.hidden_dim,
+                img_size=model_cfg.image_size,
+                patch_size=model_cfg.patch_size,
+                num_targets=model_cfg.num_targets,
+                predictor_depth=model_cfg.predictor_depth,
+                predictor_heads=model_cfg.predictor_heads,
             )
 
             if cfg.ckpt_path is not None:
@@ -107,15 +105,15 @@ class IJEPATrainerDDP:
         else:  # gated
             model = GatedIJEPA(
                 encoder=encoder,
-                hidden_emb_dim=dim,
-                img_size=image_size,
-                patch_size=patch_size,
-                predictor_depth=depth,
-                predictor_heads=heads,
-                lambda_gates=cfg.lambda_gates,
-                gate_exp_alpha=cfg.gate_exp_alpha,
-                gate_layer_index=cfg.gate_layer_index,
-                gate_location=cfg.gate_location,
+                hidden_emb_dim=model_cfg.hidden_dim,
+                img_size=model_cfg.image_size,
+                patch_size=model_cfg.patch_size,
+                predictor_depth=model_cfg.predictor_depth,
+                predictor_heads=model_cfg.predictor_heads,
+                lambda_gates=model_cfg.lambda_gates,
+                gate_exp_alpha=model_cfg.gate_exp_alpha,
+                gate_layer_index=model_cfg.gate_layer_index,
+                gate_location=model_cfg.gate_location,
             )
 
             if cfg.ckpt_path is not None:
@@ -139,8 +137,7 @@ class IJEPATrainerDDP:
 
     def _build_dataloader(
         self,
-        image_size: int,
-        patch_size: int,
+        model_cfg: IJEPAConfig,
         world_size: int,
         rank: int,
     ) -> Tuple[DataLoader, DistributedSampler]:
@@ -155,18 +152,18 @@ class IJEPATrainerDDP:
             cfg.dataset_path,
             split="unlabeled",
             download=(rank == 0),
-            transform=training_transforms((image_size, image_size)),
+            transform=training_transforms((model_cfg.image_size, model_cfg.image_size)),
         )
 
         # Ensure all ranks wait until data is ready
         dist.barrier()
 
         if cfg.variant == "baseline":
-            num_patches = int((image_size // patch_size)) ** 2
+            num_patches = int((model_cfg.image_size // model_cfg.patch_size)) ** 2
             dataset = MaskedImageDataset(
                 base_ds,
                 num_patches=num_patches,
-                num_targets=4,  # must match num_targets passed to IJEPA
+                num_targets=model_cfg.num_targets,  # must match num_targets passed to IJEPA
             )
         else:
             dataset = base_ds
@@ -227,26 +224,14 @@ class IJEPATrainerDDP:
         set_seed(SEED, rank)
 
         device = torch.device("cuda", local_rank)
-
-        # Shared model hyper-params
-        dim = 512
-        image_size = 96
-        patch_size = 8
-        depth = 6
-        heads = 6
-        num_targets = 4
+        model_cfg = self.cfg.model
 
         # Model & optimizer
         model, optimizer, training_ckpt_name, encoder_ckpt_name = self._build_model_and_optimizer(
             device,
             local_rank,
             rank,
-            dim=dim,
-            image_size=image_size,
-            patch_size=patch_size,
-            depth=depth,
-            heads=heads,
-            num_targets=num_targets,
+            model_cfg,
         )
 
         # Wrap with DDP AFTER creating the optimizer
@@ -261,8 +246,7 @@ class IJEPATrainerDDP:
 
         # Dataset & loader
         train_loader, train_sampler = self._build_dataloader(
-            image_size=image_size,
-            patch_size=patch_size,
+            model_cfg=model_cfg,
             world_size=world_size,
             rank=rank,
         )
@@ -271,7 +255,7 @@ class IJEPATrainerDDP:
 
         # Only rank 0 will run linear probing evals & print accuracy
         stl10_eval = (
-            STL10Eval(image_size=image_size, dataset_path=cfg.dataset_path)
+            STL10Eval(image_size=model_cfg.image_size, dataset_path=cfg.dataset_path)
             if rank == 0
             else None
         )
@@ -290,11 +274,11 @@ class IJEPATrainerDDP:
             )
             if cfg.variant == "gated":
                 print(
-                    f"  lambda_gates = {cfg.lambda_gates}, "
-                    f"gate_exp_alpha = {cfg.gate_exp_alpha}"
+                    f"  lambda_gates = {model_cfg.lambda_gates}, "
+                    f"gate_exp_alpha = {model_cfg.gate_exp_alpha}"
                 )
-                print(f"  gate_layer_index = {cfg.gate_layer_index}")
-                print(f"  gate_location = {cfg.gate_location}")
+                print(f"  gate_layer_index = {model_cfg.gate_layer_index}")
+                print(f"  gate_location = {model_cfg.gate_location}")
 
         # ----------------------------
         # Training loop
@@ -370,7 +354,7 @@ class IJEPATrainerDDP:
                                 ssim_png_path,
                                 title=(
                                     "Token SSIM (gate_mlp input @ block "
-                                    f"{cfg.gate_layer_index}, pos {cfg.gate_location})"
+                                    f"{model_cfg.gate_layer_index}, pos {model_cfg.gate_location})"
                                 ),
                             )
                         except Exception as e:
