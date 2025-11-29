@@ -399,6 +399,136 @@ def compute_token_ssim_matrix(
     return ssim
 
 
+def average_pairwise_cosine(
+    tokens: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Average pairwise cosine similarity between tokens for a single example.
+
+    Args:
+        tokens: (N, D) tensor of token embeddings for ONE sample.
+        eps:    numerical stability constant.
+
+    Returns:
+        scalar tensor: mean_{i != j} cos(x_i, x_j).
+    """
+    # tokens: (N, D)
+    if tokens.ndim != 2:
+        raise ValueError(f"expected tokens to have shape (N, D), got {tokens.shape}")
+
+    N, D = tokens.shape
+    if N <= 1:
+        # No pairs; return 0 as a neutral value
+        return torch.zeros((), device=tokens.device, dtype=tokens.dtype)
+
+    # Normalize per token
+    x = F.normalize(tokens, p=2, dim=-1, eps=eps)  # (N, D)
+    sim = x @ x.T                                  # (N, N), cosine similarities
+
+    # Exclude diagonal (self-similarity)
+    mask = ~torch.eye(N, dtype=torch.bool, device=sim.device)
+    return sim[mask].mean()
+
+
+def average_pairwise_cosine_batch(
+    tokens_batch: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Batch version of average_pairwise_cosine.
+
+    Args:
+        tokens_batch: (K, N, D) tensor; K examples, N tokens, D dim.
+        eps:          numerical stability constant.
+
+    Returns:
+        scalar tensor: average over K samples of their per-sample ACS.
+    """
+    if tokens_batch.ndim != 3:
+        raise ValueError(f"expected tokens_batch to have shape (K, N, D), got {tokens_batch.shape}")
+
+    K, N, D = tokens_batch.shape
+    if K == 0:
+        return torch.zeros((), device=tokens_batch.device, dtype=tokens_batch.dtype)
+
+    vals = []
+    for k in range(K):
+        vals.append(average_pairwise_cosine(tokens_batch[k], eps=eps))
+
+    return torch.stack(vals).mean()
+
+
+def effective_rank(
+    tokens: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Effective rank (erank) of the token matrix for a single example.
+
+    Uses Shannon entropy of the squared singular values:
+
+        erank = exp( H(p) ),  p_i = s_i^2 / sum_j s_j^2
+
+    where s_i are singular values of the centered token matrix.
+
+    Args:
+        tokens: (N, D) tensor of token embeddings for ONE sample.
+        eps:    numerical stability constant.
+
+    Returns:
+        scalar tensor: effective rank (>= 1).
+    """
+    if tokens.ndim != 2:
+        raise ValueError(f"expected tokens to have shape (N, D), got {tokens.shape}")
+
+    # Center across tokens (treat tokens as samples, features along dim=1)
+    x = tokens - tokens.mean(dim=0, keepdim=True)  # (N, D)
+
+    # SVD: x = U S V^T, we only need singular values S
+    # full_matrices=False for efficiency
+    _, S, _ = torch.linalg.svd(x, full_matrices=False)  # S: (min(N, D),)
+
+    # Convert singular values to a probability distribution over energy
+    energy = S ** 2
+    energy_sum = energy.sum()
+    energy = energy / (energy_sum + eps)
+
+    # Shannon entropy of spectrum (base e)
+    H = -(energy * (energy + eps).log()).sum()
+
+    erank = torch.exp(H)
+    return erank
+
+
+def effective_rank_batch(
+    tokens_batch: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Batch version of effective_rank.
+
+    Args:
+        tokens_batch: (K, N, D) tensor of token embeddings.
+        eps:          numerical stability constant.
+
+    Returns:
+        scalar tensor: average effective rank across the K samples.
+    """
+    if tokens_batch.ndim != 3:
+        raise ValueError(f"expected tokens_batch to have shape (K, N, D), got {tokens_batch.shape}")
+
+    K, N, D = tokens_batch.shape
+    if K == 0:
+        return torch.zeros((), device=tokens_batch.device, dtype=tokens_batch.dtype)
+
+    vals = []
+    for k in range(K):
+        vals.append(effective_rank(tokens_batch[k], eps=eps))
+
+    return torch.stack(vals).mean()
+
+
 def _normalize_to_uint8(
     mat: np.ndarray,
     value_range: Optional[tuple[float, float]] = None,
