@@ -12,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from simple_ijepa.config import TrainConfig
 from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import GatedPredictorEncoder
+from simple_ijepa.training.wandb_utils import make_timed_run_slug
 
 
 def setup_distributed() -> Tuple[int, int, int]:
@@ -38,11 +39,22 @@ def set_seed(seed: int, rank: int) -> None:
 
 def prepare_paths(cfg: TrainConfig) -> TrainConfig:
     root = get_original_cwd()
+
+    # Make dataset path absolute
     if not os.path.isabs(cfg.data.dataset_path):
         cfg.data.dataset_path = os.path.join(root, cfg.data.dataset_path)
-    if not os.path.isabs(cfg.logging.save_model_dir):
-        cfg.logging.save_model_dir = os.path.join(root, cfg.logging.save_model_dir)
 
+    # Base directory (absolute) for all models / logs
+    if not os.path.isabs(cfg.logging.save_model_dir):
+        base_save_dir = os.path.join(root, cfg.logging.save_model_dir)
+    else:
+        base_save_dir = cfg.logging.save_model_dir
+
+    # Use a per-run, timestamped slug as the subfolder name
+    slug = make_timed_run_slug(cfg)  # e.g. baseline-stl10-...-20251129-143215
+    cfg.logging.save_model_dir = os.path.join(base_save_dir, slug)
+
+    # Make wandb API key file path absolute if needed
     if cfg.logging.wandb_api_key_file and not os.path.isabs(cfg.logging.wandb_api_key_file):
         cfg.logging.wandb_api_key_file = os.path.join(
             root,
@@ -53,25 +65,12 @@ def prepare_paths(cfg: TrainConfig) -> TrainConfig:
 
 
 def setup_logging(cfg: TrainConfig, rank: int) -> logging.Logger:
-    """
-    Configure and return a process-aware logger.
-
-    Rank 0:
-      - logs to stdout (INFO+)
-      - logs to <save_model_dir>/training.log (DEBUG+)
-
-    Other ranks:
-      - logs to <save_model_dir>/training_rank{rank}.log (DEBUG+), no console.
-
-    Console output is always a subset of what’s in the log file.
-    """
     logger = logging.getLogger("simple_ijepa")
 
     # Avoid duplicating handlers if called multiple times in the same process
     if logger.handlers:
         return logger
 
-    # Allow DEBUG+ on the logger itself; handlers will filter what they emit.
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
@@ -95,17 +94,9 @@ def setup_logging(cfg: TrainConfig, rank: int) -> logging.Logger:
         fh.setFormatter(formatter)
         logger.addHandler(fh)
     else:
-        # Non-zero ranks: log to a separate file, full detail (DEBUG+), no console
-        log_path = os.path.join(
-            cfg.logging.save_model_dir,
-            f"training_rank{rank}.log",
-        )
-        fh = logging.FileHandler(log_path)
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+        # Non-zero ranks: no file; optional NullHandler so logging calls don’t warn
+        logger.addHandler(logging.NullHandler())
 
-    # Don't propagate to root (Hydra may have its own logging config)
     logger.propagate = False
     return logger
 

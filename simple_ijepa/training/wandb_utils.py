@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 import logging
 from typing import Optional, Any
 
@@ -65,8 +66,8 @@ def make_run_slug(cfg: Any) -> str:
     """
     Build a slug-style run name with shorthand parameters, e.g.:
 
-      baseline-stl10-bs256-ep100-lr3e-4
-      gated-stl10-bs256-ep100-lr1e-4-lam1-a4-L2-post
+      baseline-bs256_gbs1024-ep100-lr3e-4-stl10
+      gated-bs256_gbs2048-ep100-lr1e-4-lam1-a4-L2-post-stl10
 
     Works with both OmegaConf DictConfig and dataclass-like configs.
     """
@@ -75,12 +76,19 @@ def make_run_slug(cfg: Any) -> str:
     # variant: baseline / gated
     parts.append(cfg.variant)
 
-    # dataset
-    if getattr(cfg, "data", None) is not None and getattr(cfg.data, "dataset_name", None) is not None:
-        parts.append(cfg.data.dataset_name)
+    # per-device and global batch size
+    per_device_bs = cfg.dataloader.batch_size
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        world_size = 1  # fallback if env var is weird / missing
+
+    effective_global_bs = per_device_bs * world_size
+
+    # this is the bit you wanted
+    parts.append(f"bs{per_device_bs}_gbs{effective_global_bs}")
 
     # core training knobs
-    parts.append(f"bs{cfg.dataloader.batch_size}")
     parts.append(f"ep{cfg.optim.num_epochs}")
     parts.append(f"lr{_short_float(cfg.optim.learning_rate)}")
 
@@ -93,8 +101,23 @@ def make_run_slug(cfg: Any) -> str:
         parts.append(f"L{layer}")
         parts.append(m.gate_location)
 
+    # dataset (optional, if present)
+    if getattr(cfg, "data", None) is not None and getattr(cfg.data, "dataset_name", None) is not None:
+        parts.append(cfg.data.dataset_name)
+
     slug = "-".join(str(p) for p in parts)
     return slug
+
+
+def make_timed_run_slug(cfg: Any) -> str:
+    """
+    Like make_run_slug, but appends a timestamp so each run is unique:
+
+      baseline-stl10-bs256-ep100-lr3e-4-...-20251129-143215
+    """
+    base = make_run_slug(cfg)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{base}-{ts}"
 
 
 def make_run_tags(cfg: Any, world_size: int) -> list[str]:
@@ -116,6 +139,9 @@ def make_run_tags(cfg: Any, world_size: int) -> list[str]:
     tags.append(f"weight_decay={cfg.optim.weight_decay}")
     tags.append(f"fp16_precision={cfg.optim.fp16_precision}")
     tags.append(f"world_size={world_size}")
+
+    effective_global_batch_size = cfg.dataloader.batch_size * world_size
+    tags.append(f"effective_global_batch_size={effective_global_batch_size}")
 
     # Model architecture
     m = cfg.model
@@ -189,6 +215,9 @@ def init_wandb(
     if isinstance(cfg_dict, dict):
         cfg_dict.setdefault("distributed", {})
         cfg_dict["distributed"]["world_size"] = world_size
+        cfg_dict["distributed"]["effective_global_batch_size"] = (
+            cfg.dataloader.batch_size * world_size
+        )
 
     wandb.login(key=os.environ.get("WANDB_API_KEY", ""))
 
