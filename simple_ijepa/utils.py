@@ -337,3 +337,70 @@ def save_ssim_heatmap(
     # Build grayscale image and save
     img = Image.fromarray(img_arr, mode="L")
     img.save(out_path)
+
+
+def save_ssim_heatmap_grid(
+    tokens_batch: torch.Tensor,
+    out_path: str,
+    scale: int = 4,
+    pad_width: int = 4,
+    pad_value: float = 0.2,
+) -> None:
+    """
+    Save a single PNG containing a row of SSIM heatmaps, one per example,
+    with vertical padding bars on the left and right of each heatmap to
+    visually separate them.
+
+    Args:
+        tokens_batch: (K, N, D) tensor; K is number of examples (e.g. 8),
+                      N tokens, D embedding dim.
+        out_path: where to save the combined PNG.
+        scale: upscaling factor per SSIM cell (must match save_ssim_heatmap
+               if you want identical per-heatmap resolution).
+        pad_width: number of pixels for the vertical separator bar on each side.
+        pad_value: grayscale value in [0, 1] for the separator bars
+                   (e.g. 0.0 = black, 1.0 = white, 0.5 = mid-gray).
+    """
+    # Ensure CPU / detached
+    tokens_batch = tokens_batch.detach().cpu()
+    K, N, D = tokens_batch.shape
+
+    if K == 0:
+        return  # nothing to save
+
+    # Convert pad_value in [0,1] to uint8 [0,255]
+    pad_val_255 = int(np.clip(pad_value, 0.0, 1.0) * 255)
+
+    tiles = []
+    for k in range(K):
+        tokens = tokens_batch[k]  # (N, D)
+        ssim = compute_token_ssim_matrix(tokens)  # (N, N)
+
+        # (N, N) -> numpy float32
+        mat = ssim.detach().cpu().numpy().astype(np.float32)
+
+        # Map from [-1, 1] to [0, 1]
+        mat = (mat + 1.0) * 0.5
+        mat = np.clip(mat, 0.0, 1.0)
+
+        # Upscale each cell to scale x scale
+        mat_up = np.repeat(np.repeat(mat, scale, axis=0), scale, axis=1)
+
+        # Convert to 0–255 uint8
+        img_arr = (mat_up * 255.0).astype(np.uint8)  # (H, W)
+        H, W = img_arr.shape
+
+        # Vertical separator bars on left and right
+        pad_col = np.full((H, pad_width), pad_val_255, dtype=np.uint8)  # (H, pad_width)
+        tile_with_bars = np.concatenate(
+            [pad_col, img_arr, pad_col],
+            axis=1,
+        )  # (H, W + 2 * pad_width)
+
+        tiles.append(tile_with_bars)
+
+    # Concatenate all tiles horizontally -> single row
+    combined = np.concatenate(tiles, axis=1)  # (H, K * (W + 2*pad_width))
+
+    img = Image.fromarray(combined, mode="L")
+    img.save(out_path)

@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 from simple_ijepa.utils import (
     save_debug_masks,
     compute_token_ssim_matrix,
-    save_ssim_heatmap,
+    save_ssim_heatmap_grid,
 )
 
 
@@ -372,34 +372,23 @@ def log_debug_artifacts(
             logger.warning("Failed to save/log debug masks: %s", e)
 
     # -------------------
-    # 2) Token SSIM heatmap
+    # 2) Token SSIM heatmap grid (first up to 8 examples)
     # -------------------
-    if "gate_mlp_input_example" in stats:
+    if "gate_mlp_input_examples" in stats:
         try:
-            tokens = stats["gate_mlp_input_example"]  # (N, D)
-            ssim_mat = compute_token_ssim_matrix(tokens)
-
+            tokens_batch = stats["gate_mlp_input_examples"]  # (K, N, D)
             debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
             os.makedirs(debug_dir, exist_ok=True)
 
-            ssim_pt_path = os.path.join(
-                debug_dir, f"{step_str}_token_ssim.pt"
-            )
             ssim_png_path = os.path.join(
-                debug_dir, f"{step_str}_token_ssim.png"
+                debug_dir, f"{step_str}_token_ssim_grid.png"
             )
 
-            torch.save(ssim_mat, ssim_pt_path)
-            save_ssim_heatmap(
-                ssim_mat,
-                ssim_png_path,
-                title=(
-                    "Token SSIM (gate_mlp input @ block "
-                    f"{model_cfg.gate_layer_index}, pos {model_cfg.gate_location})"
-                ),
-            )
+            # Single PNG with a row of K SSIM heatmaps (K ≤ 8)
+            save_ssim_heatmap_grid(tokens_batch, ssim_png_path)
+
             logger.info(
-                "Saved token SSIM debug artifacts for epoch %d, step %d under %s",
+                "Saved token SSIM grid for epoch %d, step %d under %s",
                 epoch + 1,
                 global_step + 1,
                 debug_dir,
@@ -408,7 +397,7 @@ def log_debug_artifacts(
             if wandb is not None:
                 wandb_run.log(
                     {
-                        "debug/token_ssim": wandb.Image(ssim_png_path),
+                        "debug/token_ssim_grid": wandb.Image(ssim_png_path),
                     },
                     step=step,
                 )

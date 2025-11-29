@@ -222,13 +222,13 @@ class GatedIJEPA(BaseIJEPA):
               [gate on x]
 
         Returns:
-            student_tokens:          (B, N, D) final normalized tokens after all blocks
-                                     (already influenced by gating).
-            gate_values:             (B, N) sampled gate values in [0, 1]
-            gate_probs:              (B, N) open probabilities π_{b,i}
-            gate_mlp_input_example:  (N, D) the *token matrix* that was fed
-                                     into gate_mlp, for a representative sample
-                                     (used for SSIM observability).
+            student_tokens:         (B, N, D) final normalized tokens after all blocks
+                                    (already influenced by gating).
+            gate_values:            (B, N) sampled gate values in [0, 1]
+            gate_probs:             (B, N) open probabilities π_{b,i}
+            "gate_mlp_input_examples": (K, N, D) tokens fed to gate_mlp for
+                                    the first K samples in the batch
+                                    (K ≤ 8, used for SSIM observability).
         """
         vt = self.context_encoder
         device = img.device
@@ -240,7 +240,7 @@ class GatedIJEPA(BaseIJEPA):
         depth = len(vt.transformer.layers)
         gate_values: torch.Tensor | None = None
         gate_probs: torch.Tensor | None = None
-        gate_mlp_input_example: torch.Tensor | None = None
+        gate_mlp_input_examples: torch.Tensor | None = None
 
         for layer_idx, (attn, ff) in enumerate(vt.transformer.layers):
             if layer_idx != self.gate_layer_index:
@@ -321,18 +321,19 @@ class GatedIJEPA(BaseIJEPA):
 
                 x = r * x + one_minus_r * mask_tokens            # (B, N, D)
 
-            # whatever gate_mlp_input we used, keep one example for observability
-            gate_mlp_input_example = gate_mlp_input[0].detach()  # (N, D)
+            # whatever gate_mlp_input we used, keep up to 8 examples for observability
+            num_debug = min(8, gate_mlp_input.shape[0])
+            gate_mlp_input_examples = gate_mlp_input[:num_debug].detach()  # (K, N, D)
 
         # Final LayerNorm of the transformer
         x = vt.transformer.norm(x)                               # (B, N, D)
 
-        if gate_values is None or gate_probs is None or gate_mlp_input_example is None:
+        if gate_values is None or gate_probs is None or gate_mlp_input_examples is None:
             raise RuntimeError(
                 "Internal gating requested but gate_layer_index was never hit."
             )
 
-        return x, gate_values, gate_probs, gate_mlp_input_example
+        return x, gate_values, gate_probs, gate_mlp_input_examples
 
 
     def forward(
@@ -380,19 +381,15 @@ class GatedIJEPA(BaseIJEPA):
         )
 
         if use_internal_gating:
-            # Gating happens inside the encoder after block gate_layer_index.
-            # Remaining blocks see masked tokens. Predictor sees final masked tokens.
             (
                 student_tokens,
                 gate_values,
                 gate_probs,
-                gate_mlp_input_example,
+                gate_mlp_input_examples,
             ) = self._encode_student_with_internal_gating(img)
             context_tokens = student_tokens  # already masked by encoder
 
         else:
-            # Original behavior: context encoder sees full image;
-            # gating only affects predictor input (post-encoder).
             student_tokens = self.context_encoder(img)          # (B, N, D)
 
             # Gate MLP input in this case is simply the final student tokens
@@ -415,8 +412,9 @@ class GatedIJEPA(BaseIJEPA):
 
             context_tokens = r * student_tokens + one_minus_r * mask_tokens
 
-            # Example for SSIM observability
-            gate_mlp_input_example = gate_mlp_input[0].detach()  # (N, D)
+            # Examples for SSIM observability: first up to 8 samples
+            num_debug = min(8, gate_mlp_input.shape[0])
+            gate_mlp_input_examples = gate_mlp_input[:num_debug].detach()  # (K, N, D)
 
         # -------------------------
         # 3. Predictor
@@ -472,7 +470,7 @@ class GatedIJEPA(BaseIJEPA):
             "closed_frac_per_sample": closed_frac_per_sample.detach(),
             "gate_map_example": gate_map_example,
             "gate_values_full": gate_values.detach(),
-            "gate_mlp_input_example": gate_mlp_input_example,  # (N, D)
+            "gate_mlp_input_examples": gate_mlp_input_examples,  # (K, N, D)
         }
 
         return total_loss, stats
