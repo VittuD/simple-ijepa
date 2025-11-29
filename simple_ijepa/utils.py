@@ -3,7 +3,8 @@ from torchvision.utils import save_image
 import torch.nn.functional as F
 import torch
 import math, warnings, os
-import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
 
 
 def training_transforms(img_size):
@@ -305,24 +306,29 @@ def compute_token_ssim_matrix(
 def save_ssim_heatmap(
     ssim_matrix: torch.Tensor,
     out_path: str,
-    title: str = "Token SSIM",
+    title: str = "Token SSIM",  # kept for compatibility, not used
 ) -> None:
     """
-    Save a heatmap visualization of an SSIM matrix.
-
-    Args:
-        ssim_matrix: Tensor of shape (N, N).
-        out_path:    Path to save the PNG.
-        title:       Plot title.
+    Save SSIM matrix as a grayscale heatmap, where each token pair
+    is rendered as a 4x4 block (fixed 4x upscale in both dimensions).
     """
-    mat = ssim_matrix.detach().cpu().numpy()
+    # (N, N) -> numpy float32
+    mat = ssim_matrix.detach().cpu().numpy().astype(np.float32)
 
-    plt.figure(figsize=(5, 4))
-    im = plt.imshow(mat, origin="lower", aspect="equal", vmin=-1.0, vmax=1.0)
-    plt.title(title)
-    plt.xlabel("Token index")
-    plt.ylabel("Token index")
-    plt.colorbar(im, fraction=0.046, pad=0.04, label="SSIM")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    # Map from [-1, 1] to [0, 1]
+    mat = (mat + 1.0) * 0.5
+    mat = np.clip(mat, 0.0, 1.0)
+
+    # NOTE: Fixed upscale factor
+    scale = 4
+
+    # Expand each entry into a scale x scale block:
+    # mat: (N, N) -> mat_up: (N*scale, N*scale)
+    mat_up = np.repeat(np.repeat(mat, scale, axis=0), scale, axis=1)
+
+    # Convert to 0–255 uint8
+    img_arr = (mat_up * 255.0).astype(np.uint8)
+
+    # Build grayscale image and save
+    img = Image.fromarray(img_arr, mode="L")
+    img.save(out_path)
