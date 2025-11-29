@@ -6,8 +6,15 @@ import os
 from datetime import datetime
 import logging
 from typing import Optional, Any
+import torch
 
 from omegaconf import OmegaConf
+
+from simple_ijepa.utils import (
+    save_debug_masks,
+    compute_token_ssim_matrix,
+    save_ssim_heatmap,
+)
 
 
 def _load_api_key_from_file(
@@ -258,3 +265,153 @@ def log_metrics(
     except Exception:
         # Avoid breaking the training loop on W&B hiccups
         pass
+
+
+def log_artifact_files(
+    run: Optional[Any],
+    file_paths: list[str],
+    artifact_name: str,
+    artifact_type: str = "debug",
+    metadata: Optional[dict] = None,
+) -> None:
+    """
+    Attach a set of files to a W&B run as an artifact.
+
+    Args:
+        run: W&B run object (or None -> no-op).
+        file_paths: List of filesystem paths to attach.
+        artifact_name: Name of the artifact (e.g. "debug_masks_e001_s000123").
+        artifact_type: Artifact type (e.g. "debug_masks", "debug_ssim").
+        metadata: Optional dict stored with the artifact (epoch, step, etc.).
+    """
+    if run is None:
+        return
+
+    try:
+        import wandb  # type: ignore
+
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type=artifact_type,
+            metadata=metadata or {},
+        )
+        for p in file_paths:
+            if os.path.exists(p):
+                artifact.add_file(p)
+
+        run.log_artifact(artifact)
+    except Exception:
+        # Never break training on W&B issues
+        return
+
+def log_debug_artifacts(
+    *,
+    cfg: Any,
+    stats: dict,
+    images: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    model_cfg: Any,
+    logger: Optional[logging.Logger],
+    wandb_run: Optional[Any],
+) -> None:
+    """
+    Save mask + SSIM debug artifacts to disk and (optionally) log them to W&B
+    as plain images at the current epoch/step.
+
+    Called from the trainer only for:
+      - gated variant
+      - rank 0
+      - first step of each epoch
+    """
+    if logger is None:
+        logger = logging.getLogger("simple_ijepa.debug")
+
+    step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
+    step = global_step + 1
+
+    # Try to import wandb only if we actually have a run
+    wandb = None
+    if wandb_run is not None:
+        try:
+            import wandb as _wandb  # type: ignore
+            wandb = _wandb
+        except Exception:
+            wandb = None
+
+    # -------------------
+    # 1) Patch masks
+    # -------------------
+    if "gate_values_full" in stats:
+        try:
+            orig_path, masked_path = save_debug_masks(
+                images=images,
+                gate_values_full=stats["gate_values_full"],
+                epoch=epoch,
+                global_step=global_step,
+                save_root=cfg.logging.save_model_dir,
+                image_size=model_cfg.image_size,
+                patch_size=model_cfg.patch_size,
+                max_images=8,
+            )
+            logger.info(
+                "Saved debug masks for epoch %d, step %d under %s/debug_masks",
+                epoch + 1,
+                global_step + 1,
+                cfg.logging.save_model_dir,
+            )
+
+            if wandb is not None:
+                wandb_run.log(
+                    {
+                        "debug/masks_orig": wandb.Image(orig_path),
+                        "debug/masks_masked": wandb.Image(masked_path),
+                    },
+                    step=step,
+                )
+        except Exception as e:
+            logger.warning("Failed to save/log debug masks: %s", e)
+
+    # -------------------
+    # 2) Token SSIM heatmap
+    # -------------------
+    if "gate_mlp_input_example" in stats:
+        try:
+            tokens = stats["gate_mlp_input_example"]  # (N, D)
+            ssim_mat = compute_token_ssim_matrix(tokens)
+
+            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            ssim_pt_path = os.path.join(
+                debug_dir, f"{step_str}_token_ssim.pt"
+            )
+            ssim_png_path = os.path.join(
+                debug_dir, f"{step_str}_token_ssim.png"
+            )
+
+            torch.save(ssim_mat, ssim_pt_path)
+            save_ssim_heatmap(
+                ssim_mat,
+                ssim_png_path,
+                title=(
+                    "Token SSIM (gate_mlp input @ block "
+                    f"{model_cfg.gate_layer_index}, pos {model_cfg.gate_location})"
+                ),
+            )
+            logger.info(
+                "Saved token SSIM debug artifacts for epoch %d, step %d under %s",
+                epoch + 1,
+                global_step + 1,
+                debug_dir,
+            )
+
+            if wandb is not None:
+                wandb_run.log(
+                    {
+                        "debug/token_ssim": wandb.Image(ssim_png_path),
+                    },
+                    step=step,
+                )
+        except Exception as e:
+            logger.warning("Failed to compute/save/log token SSIM: %s", e)

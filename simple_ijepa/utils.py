@@ -108,7 +108,7 @@ def save_debug_masks(
     image_size: int,
     patch_size: int,
     max_images: int = 8,
-) -> None:
+) -> tuple[str, str]:
     """
     Save original and patch-masked versions of the first few images in the batch,
     using the gate values to decide which patches to "mask".
@@ -177,6 +177,8 @@ def save_debug_masks(
         normalize=True,
         value_range=(0.0, 1.0),
     )
+
+    return orig_path, masked_path
 
 
 class GatedPredictorEncoder(torch.nn.Module):

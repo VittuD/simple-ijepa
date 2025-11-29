@@ -18,15 +18,16 @@ from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import (
     update_gamma,
     training_transforms,
-    save_debug_masks,
-    compute_token_ssim_matrix,
-    save_ssim_heatmap,
 )
 from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
 from simple_ijepa.config import TrainConfig
 from simple_ijepa.configuration_ijepa import IJEPAConfig
-from simple_ijepa.training.wandb_utils import init_wandb, log_metrics
+from simple_ijepa.training.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_debug_artifacts,
+)
 from simple_ijepa.training.dist_utils import (
     maybe_run_eval,
     prepare_paths,
@@ -327,79 +328,24 @@ class IJEPATrainerDDP:
                     ddp_model, batch, device, cfg.optim.fp16_precision
                 )
 
-                # ------------------------------------------------------
-                # Gated-only debug visualizations (masks + SSIM)
-                # - controlled by cfg.save_debug_masks
-                # - only rank 0
-                # - masks: first step of every epoch
-                # - SSIM:  first batch of the first epoch (epoch==0, step==0)
-                # ------------------------------------------------------
+                # Gated-only debug visualizations (masks + SSIM + W&B artifacts)
                 if (
                     cfg.variant == "gated"
                     and cfg.debug.save_debug_masks
                     and rank == 0
                     and isinstance(stats, dict)
+                    and step == 0  # first step of each epoch
                 ):
-                    # 1) Patch masks (first step of each epoch)
-                    if step == 0 and "gate_values_full" in stats:
-                        try:
-                            save_debug_masks(
-                                images=images,
-                                gate_values_full=stats["gate_values_full"],
-                                epoch=epoch,
-                                global_step=global_step,
-                                save_root=cfg.logging.save_model_dir,
-                                image_size=model_cfg.image_size,
-                                patch_size=model_cfg.patch_size,
-                                max_images=8,
-                            )
-                            logger.info(
-                                "Saved debug masks for epoch %d, step %d under %s/debug_masks",
-                                epoch + 1,
-                                global_step + 1,
-                                cfg.logging.save_model_dir,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to save debug masks: %s", e)
-
-                    # 2) SSIM on gate_mlp input (only first batch of run)
-                    if step == 0 and "gate_mlp_input_example" in stats:
-                        try:
-                            tokens = stats["gate_mlp_input_example"]  # (N, D)
-                            ssim_mat = compute_token_ssim_matrix(tokens)
-
-                            debug_dir = os.path.join(
-                                cfg.logging.save_model_dir, "debug_ssim"
-                            )
-                            os.makedirs(debug_dir, exist_ok=True)
-
-                            step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
-                            ssim_pt_path = os.path.join(
-                                debug_dir, f"{step_str}_token_ssim.pt"
-                            )
-                            ssim_png_path = os.path.join(
-                                debug_dir, f"{step_str}_token_ssim.png"
-                            )
-
-                            torch.save(ssim_mat, ssim_pt_path)
-                            save_ssim_heatmap(
-                                ssim_mat,
-                                ssim_png_path,
-                                title=(
-                                    "Token SSIM (gate_mlp input @ block "
-                                    f"{model_cfg.gate_layer_index}, pos {model_cfg.gate_location})"
-                                ),
-                            )
-                            logger.info(
-                                "Saved token SSIM debug artifacts for epoch %d, step %d under %s",
-                                epoch + 1,
-                                global_step + 1,
-                                debug_dir,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to compute/save token SSIM: %s", e
-                            )
+                    log_debug_artifacts(
+                        cfg=cfg,
+                        stats=stats,
+                        images=images,
+                        epoch=epoch,
+                        global_step=global_step,
+                        model_cfg=model_cfg,
+                        logger=logger,
+                        wandb_run=wandb_run,
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -524,4 +470,3 @@ class IJEPATrainerDDP:
                     logger.warning("Failed to properly finish W&B run.", exc_info=False)
 
         dist.destroy_process_group()
-
