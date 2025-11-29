@@ -5,6 +5,7 @@ import torch
 import math, warnings, os
 import numpy as np
 from PIL import Image
+from typing import Callable, Optional
 
 
 def training_transforms(img_size):
@@ -261,8 +262,98 @@ class GatedPredictorEncoder(torch.nn.Module):
 
 
 # ----------------------------------------------------------------------
-# SSIM utilities for token embeddings
+# Token similarity / distance matrices & heatmap utilities
 # ----------------------------------------------------------------------
+
+def dot_sim_matrix(tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Simple dot-product similarity between tokens.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) matrix with entry (i, j) = <x_i, x_j>.
+    """
+    return tokens @ tokens.T  # (N, N)
+
+
+def euclidean_dist2_matrix(tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Squared Euclidean distance matrix.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) matrix with ||x_i - x_j||^2.
+    """
+    x = tokens
+    # (N,)
+    sq_norm = (x ** 2).sum(dim=1)
+    # (N, N): ||x_i||^2 + ||x_j||^2 - 2 x_i·x_j
+    dist2 = sq_norm.unsqueeze(1) + sq_norm.unsqueeze(0) - 2 * (x @ x.T)
+    # numerical safety
+    return torch.clamp(dist2, min=0.0)
+
+
+def rbf_kernel_matrix(tokens: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    """
+    RBF / Gaussian kernel similarity based on squared Euclidean distance.
+
+    Args:
+        tokens: (N, D) tensor.
+        sigma:  kernel width.
+
+    Returns:
+        (N, N) matrix with exp(-||x_i - x_j||^2 / (2 * sigma^2)).
+    """
+    dist2 = euclidean_dist2_matrix(tokens)
+    return torch.exp(-dist2 / (2 * sigma ** 2))
+
+
+def token_corr_matrix(tokens: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Pearson correlation matrix over token features.
+
+    Args:
+        tokens: (N, D) tensor.
+        eps:    small constant for numerical stability.
+
+    Returns:
+        (N, N) correlation matrix in [-1, 1].
+    """
+    x = tokens
+    N, D = x.shape
+
+    mu = x.mean(dim=1, keepdim=True)        # (N, 1)
+    x_centered = x - mu                     # (N, D)
+
+    # Use max(D-1, 1) to avoid division by zero when D == 1
+    denom_d = max(D - 1, 1)
+    cov = (x_centered @ x_centered.T) / denom_d   # (N, N)
+    var = cov.diag()                               # (N,)
+
+    std = torch.sqrt(var + eps)                   # (N,)
+    denom = std.unsqueeze(0) * std.unsqueeze(1)   # (N, N)
+
+    corr = cov / (denom + eps)
+    return torch.clamp(corr, -1.0, 1.0)
+
+
+def cosine_sim_matrix(tokens: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Cosine similarity matrix between tokens.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) cosine similarity matrix in [-1, 1].
+    """
+    x = F.normalize(tokens, p=2, dim=-1, eps=eps)  # (N, D), rows unit norm
+    return x @ x.T                                  # (N, N)
+
 
 def compute_token_ssim_matrix(
     tokens: torch.Tensor,
@@ -308,90 +399,191 @@ def compute_token_ssim_matrix(
     return ssim
 
 
-def save_ssim_heatmap(
-    ssim_matrix: torch.Tensor,
+def _normalize_to_uint8(
+    mat: np.ndarray,
+    value_range: Optional[tuple[float, float]] = None,
+) -> np.ndarray:
+    """
+    Normalize a float matrix to uint8 [0, 255] for visualization.
+    """
+    mat = np.asarray(mat, dtype=np.float32)
+
+    if mat.size == 0:
+        return np.zeros_like(mat, dtype=np.uint8)
+
+    if value_range is not None:
+        vmin, vmax = value_range
+    else:
+        vmin = float(np.nanmin(mat))
+        vmax = float(np.nanmax(mat))
+
+    # Replace non-finite entries with the minimum
+    mat = np.where(np.isfinite(mat), mat, vmin)
+
+    if vmax <= vmin:
+        return np.zeros_like(mat, dtype=np.uint8)
+
+    mat = (mat - vmin) / (vmax - vmin)
+    mat = np.clip(mat, 0.0, 1.0)
+    return (mat * 255.0).astype(np.uint8)
+
+
+def save_heatmap_from_matrix(
+    matrix: torch.Tensor | np.ndarray,
     out_path: str,
-    title: str = "Token SSIM",  # kept for compatibility, not used
+    scale: int = 4,
+    value_range: Optional[tuple[float, float]] = None,
 ) -> None:
     """
-    Save SSIM matrix as a grayscale heatmap, where each token pair
-    is rendered as a 4x4 block (fixed 4x upscale in both dimensions).
+    Save a precomputed similarity/distance matrix as a grayscale heatmap,
+    where each cell is rendered as a `scale` x `scale` block.
+
+    Args:
+        matrix:      (N, N) similarity / distance matrix.
+        out_path:    Path to the PNG file.
+        scale:       Integer upscale factor for each cell.
+        value_range: Optional (vmin, vmax) for normalization. If None,
+                     uses matrix min/max.
     """
-    # (N, N) -> numpy float32
-    mat = ssim_matrix.detach().cpu().numpy().astype(np.float32)
+    if isinstance(matrix, torch.Tensor):
+        mat_np = matrix.detach().cpu().numpy().astype(np.float32)
+    else:
+        mat_np = np.asarray(matrix, dtype=np.float32)
 
-    # Map from [-1, 1] to [0, 1]
-    mat = (mat + 1.0) * 0.5
-    mat = np.clip(mat, 0.0, 1.0)
+    img_arr = _normalize_to_uint8(mat_np, value_range=value_range)
 
-    # NOTE: Fixed upscale factor
-    scale = 4
+    if scale > 1:
+        img_arr = np.repeat(np.repeat(img_arr, scale, axis=0), scale, axis=1)
 
-    # Expand each entry into a scale x scale block:
-    # mat: (N, N) -> mat_up: (N*scale, N*scale)
-    mat_up = np.repeat(np.repeat(mat, scale, axis=0), scale, axis=1)
-
-    # Convert to 0–255 uint8
-    img_arr = (mat_up * 255.0).astype(np.uint8)
-
-    # Build grayscale image and save
     img = Image.fromarray(img_arr, mode="L")
     img.save(out_path)
 
 
-def save_ssim_heatmap_grid(
+def save_heatmap(
+    tokens: torch.Tensor,
+    out_path: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    scale: int = 4,
+    value_range: Optional[tuple[float, float]] = None,
+) -> None:
+    """
+    Generic heatmap saver: compute a token-token metric matrix with
+    `metric_fn(tokens)` and save it as a grayscale image.
+
+    By default, uses cosine similarity.
+
+    Args:
+        tokens:     (N, D) token embeddings.
+        out_path:   Path to the PNG file.
+        metric_fn:  Callable mapping (N, D) -> (N, N). Default is
+                    cosine_sim_matrix.
+        scale:      Integer upscale factor for each cell.
+        value_range:Optional (vmin, vmax) for normalization. If None,
+                    uses matrix min/max.
+    """
+    if metric_fn is None:
+        metric_fn = cosine_sim_matrix
+
+    matrix = metric_fn(tokens)
+    save_heatmap_from_matrix(
+        matrix,
+        out_path=out_path,
+        scale=scale,
+        value_range=value_range,
+    )
+
+
+def save_sim_heatmap_grid(
     tokens_batch: torch.Tensor,
     out_path: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     scale: int = 4,
     pad_width: int = 4,
     pad_value: float = 0.2,
+    max_cols: int = 8,
+    value_range: Optional[tuple[float, float]] = None,
 ) -> None:
     """
-    Save a single PNG containing a row of SSIM heatmaps, one per example,
-    with vertical padding bars on the left and right of each heatmap to
-    visually separate them.
+    Save a PNG containing a grid of heatmaps (one per example), using a
+    token-token metric.
+
+    Layout:
+      - up to `max_cols` heatmaps per row
+      - each heatmap has vertical separator bars on left and right
 
     Args:
-        tokens_batch: (K, N, D) tensor; K is number of examples (e.g. 8),
-                      N tokens, D embedding dim.
-        out_path: where to save the combined PNG.
-        scale: upscaling factor per SSIM cell (must match save_ssim_heatmap
-               if you want identical per-heatmap resolution).
-        pad_width: number of pixels for the vertical separator bar on each side.
-        pad_value: grayscale value in [0, 1] for the separator bars
-                   (e.g. 0.0 = black, 1.0 = white, 0.5 = mid-gray).
+        tokens_batch: (K, N, D) tensor; K examples, N tokens, D dim.
+        out_path:     Where to save the combined PNG.
+        metric_fn:    Callable mapping (N, D) -> (N, N).
+                      Defaults to cosine similarity (cosine_sim_matrix).
+        scale:        Upscaling factor per cell (visual size).
+        pad_width:    Pixel width of vertical separator bars.
+        pad_value:    Grayscale value in [0, 1] for separator bars.
+        max_cols:     Maximum number of heatmaps per row.
+        value_range:  Optional (vmin, vmax) for normalization across ALL
+                      tiles. If None, uses global min/max over all matrices.
     """
-    # Ensure CPU / detached
     tokens_batch = tokens_batch.detach().cpu()
     K, N, D = tokens_batch.shape
 
     if K == 0:
         return  # nothing to save
 
-    # Convert pad_value in [0,1] to uint8 [0,255]
-    pad_val_255 = int(np.clip(pad_value, 0.0, 1.0) * 255)
+    if metric_fn is None:
+        # Default: cosine similarity
+        metric_fn = cosine_sim_matrix
 
-    tiles = []
+    # ---------------------------------------------------------
+    # 1) Compute all metric matrices and gather global min/max
+    # ---------------------------------------------------------
+    matrices: list[np.ndarray] = []
+    global_min = float("inf")
+    global_max = float("-inf")
+
     for k in range(K):
         tokens = tokens_batch[k]  # (N, D)
-        ssim = compute_token_ssim_matrix(tokens)  # (N, N)
+        mat = metric_fn(tokens)   # (N, N)
 
-        # (N, N) -> numpy float32
-        mat = ssim.detach().cpu().numpy().astype(np.float32)
+        if isinstance(mat, torch.Tensor):
+            mat_np = mat.detach().cpu().numpy().astype(np.float32)
+        else:
+            mat_np = np.asarray(mat, dtype=np.float32)
 
-        # Map from [-1, 1] to [0, 1]
-        mat = (mat + 1.0) * 0.5
-        mat = np.clip(mat, 0.0, 1.0)
+        matrices.append(mat_np)
 
-        # Upscale each cell to scale x scale
-        mat_up = np.repeat(np.repeat(mat, scale, axis=0), scale, axis=1)
+        if value_range is None:
+            finite = mat_np[np.isfinite(mat_np)]
+            if finite.size > 0:
+                mmin = float(finite.min())
+                mmax = float(finite.max())
+                global_min = min(global_min, mmin)
+                global_max = max(global_max, mmax)
 
-        # Convert to 0–255 uint8
-        img_arr = (mat_up * 255.0).astype(np.uint8)  # (H, W)
+    # Decide normalization range
+    if value_range is not None:
+        vmin, vmax = value_range
+    else:
+        if not np.isfinite(global_min) or not np.isfinite(global_max) or global_max <= global_min:
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmin, vmax = global_min, global_max
+
+    pad_val_255 = int(np.clip(pad_value, 0.0, 1.0) * 255)
+
+    # ---------------------------------------------------------
+    # 2) Build per-example tiles with vertical separator bars
+    # ---------------------------------------------------------
+    tiles: list[np.ndarray] = []
+    for mat_np in matrices:
+        img_arr = _normalize_to_uint8(mat_np, value_range=(vmin, vmax))
+
+        if scale > 1:
+            img_arr = np.repeat(np.repeat(img_arr, scale, axis=0), scale, axis=1)
+
         H, W = img_arr.shape
 
         # Vertical separator bars on left and right
-        pad_col = np.full((H, pad_width), pad_val_255, dtype=np.uint8)  # (H, pad_width)
+        pad_col = np.full((H, pad_width), pad_val_255, dtype=np.uint8)
         tile_with_bars = np.concatenate(
             [pad_col, img_arr, pad_col],
             axis=1,
@@ -399,8 +591,21 @@ def save_ssim_heatmap_grid(
 
         tiles.append(tile_with_bars)
 
-    # Concatenate all tiles horizontally -> single row
-    combined = np.concatenate(tiles, axis=1)  # (H, K * (W + 2*pad_width))
+    # ---------------------------------------------------------
+    # 3) Arrange tiles into a grid (rows x cols)
+    # ---------------------------------------------------------
+    num_cols = min(max_cols, K)
+    num_rows = int(math.ceil(K / num_cols))
+
+    row_images: list[np.ndarray] = []
+    for r in range(num_rows):
+        row_tiles = tiles[r * num_cols : (r + 1) * num_cols]
+        if not row_tiles:
+            continue
+        row_img = np.concatenate(row_tiles, axis=1)
+        row_images.append(row_img)
+
+    combined = np.concatenate(row_images, axis=0)  # stack rows vertically
 
     img = Image.fromarray(combined, mode="L")
     img.save(out_path)

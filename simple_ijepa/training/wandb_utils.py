@@ -12,8 +12,8 @@ from omegaconf import OmegaConf
 
 from simple_ijepa.utils import (
     save_debug_masks,
-    compute_token_ssim_matrix,
-    save_ssim_heatmap_grid,
+    save_sim_heatmap_grid,
+    cosine_sim_matrix,
 )
 
 
@@ -281,7 +281,7 @@ def log_artifact_files(
         run: W&B run object (or None -> no-op).
         file_paths: List of filesystem paths to attach.
         artifact_name: Name of the artifact (e.g. "debug_masks_e001_s000123").
-        artifact_type: Artifact type (e.g. "debug_masks", "debug_ssim").
+        artifact_type: Artifact type (e.g. "debug_masks", "debug_sim").
         metadata: Optional dict stored with the artifact (epoch, step, etc.).
     """
     if run is None:
@@ -316,7 +316,7 @@ def log_debug_artifacts(
     wandb_run: Optional[Any],
 ) -> None:
     """
-    Save mask + SSIM debug artifacts to disk and (optionally) log them to W&B
+    Save mask + sim debug artifacts to disk and (optionally) log them to W&B
     as plain images at the current epoch/step.
 
     Called from the trainer only for:
@@ -372,23 +372,27 @@ def log_debug_artifacts(
             logger.warning("Failed to save/log debug masks: %s", e)
 
     # -------------------
-    # 2) Token SSIM heatmap grid (first up to 8 examples)
+    # 2) Token sim heatmap grid (first up to 8 examples)
     # -------------------
     if "gate_mlp_input_examples" in stats:
         try:
             tokens_batch = stats["gate_mlp_input_examples"]  # (K, N, D)
-            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
+            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_sim")
             os.makedirs(debug_dir, exist_ok=True)
 
             ssim_png_path = os.path.join(
-                debug_dir, f"{step_str}_token_ssim_grid.png"
+                debug_dir, f"{step_str}_token_metric_grid.png"
             )
 
-            # Single PNG with a row of K SSIM heatmaps (K ≤ 8)
-            save_ssim_heatmap_grid(tokens_batch, ssim_png_path)
+            # cosine similarity grid
+            save_sim_heatmap_grid(
+                tokens_batch,
+                ssim_png_path,
+                metric_fn=cosine_sim_matrix,
+            )
 
             logger.info(
-                "Saved token SSIM grid for epoch %d, step %d under %s",
+                "Saved token similarity grid for epoch %d, step %d under %s",
                 epoch + 1,
                 global_step + 1,
                 debug_dir,
@@ -397,9 +401,9 @@ def log_debug_artifacts(
             if wandb is not None:
                 wandb_run.log(
                     {
-                        "debug/token_ssim_grid": wandb.Image(ssim_png_path),
+                        "debug/token_sim_grid": wandb.Image(ssim_png_path),
                     },
                     step=step,
                 )
         except Exception as e:
-            logger.warning("Failed to compute/save/log token SSIM: %s", e)
+            logger.warning("Failed to compute/save/log token similarity grid: %s", e)
