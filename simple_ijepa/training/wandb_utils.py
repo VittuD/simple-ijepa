@@ -340,11 +340,11 @@ def log_debug_artifacts(
             wandb = None
 
     # -------------------
-    # 1) Patch masks
+    # 1) Patch masks (single combined image)
     # -------------------
     if "gate_values_full" in stats:
         try:
-            orig_path, masked_path = save_debug_masks(
+            combined_path = save_debug_masks(
                 images=images,
                 gate_values_full=stats["gate_values_full"],
                 epoch=epoch,
@@ -355,7 +355,7 @@ def log_debug_artifacts(
                 max_images=8,
             )
             logger.info(
-                "Saved debug masks for epoch %d, step %d under %s/debug_masks",
+                "Saved combined debug masks for epoch %d, step %d under %s/debug_masks",
                 epoch + 1,
                 global_step + 1,
                 cfg.logging.save_model_dir,
@@ -364,8 +364,7 @@ def log_debug_artifacts(
             if wandb is not None:
                 wandb_run.log(
                     {
-                        "debug/masks_orig": wandb.Image(orig_path),
-                        "debug/masks_masked": wandb.Image(masked_path),
+                        "debug/masks_orig_masked": wandb.Image(combined_path),
                     },
                     step=step,
                 )

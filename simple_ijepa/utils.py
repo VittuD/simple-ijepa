@@ -108,10 +108,16 @@ def save_debug_masks(
     image_size: int,
     patch_size: int,
     max_images: int = 8,
-) -> tuple[str, str]:
+) -> str:
     """
-    Save original and patch-masked versions of the first few images in the batch,
-    using the gate values to decide which patches to "mask".
+    Save a single debug image that contains, for the first few images
+    in the batch:
+
+      - top row: original images
+      - bottom row: patch-masked images (based on gate_values_full)
+
+    Returns:
+        combined_path: path to the saved PNG.
     """
     os.makedirs(os.path.join(save_root, "debug_masks"), exist_ok=True)
     debug_dir = os.path.join(save_root, "debug_masks")
@@ -157,28 +163,25 @@ def save_debug_masks(
 
         masked_images.append(img_masked)
 
-    masked_batch = torch.stack(masked_images, dim=0)
+    masked_batch = torch.stack(masked_images, dim=0)  # (K, C, H, W)
+
+    # Build a single grid image:
+    #   top row: original
+    #   bottom row: masked
+    combined_batch = torch.cat([images_cpu, masked_batch], dim=0)  # (2K, C, H, W)
 
     step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
-    orig_path = os.path.join(debug_dir, f"{step_str}_orig.png")
-    masked_path = os.path.join(debug_dir, f"{step_str}_masked.png")
+    combined_path = os.path.join(debug_dir, f"{step_str}_orig_masked.png")
 
     save_image(
-        images_cpu,
-        orig_path,
-        nrow=num_to_save,
-        normalize=True,
-        value_range=(0.0, 1.0),
-    )
-    save_image(
-        masked_batch,
-        masked_path,
-        nrow=num_to_save,
+        combined_batch,
+        combined_path,
+        nrow=num_to_save,           # K columns -> 2 rows
         normalize=True,
         value_range=(0.0, 1.0),
     )
 
-    return orig_path, masked_path
+    return combined_path
 
 
 class GatedPredictorEncoder(torch.nn.Module):
