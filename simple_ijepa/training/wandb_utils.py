@@ -68,8 +68,7 @@ def make_run_slug(cfg: Any) -> str:
       baseline-stl10-bs256-ep100-lr3e-4
       gated-stl10-bs256-ep100-lr1e-4-lam1-a4-L2-post
 
-    Works with both OmegaConf DictConfig and dataclass-like configs
-    (anything with attribute access).
+    Works with both OmegaConf DictConfig and dataclass-like configs.
     """
     parts = []
 
@@ -96,6 +95,50 @@ def make_run_slug(cfg: Any) -> str:
 
     slug = "-".join(str(p) for p in parts)
     return slug
+
+
+def make_run_tags(cfg: Any, world_size: int) -> list[str]:
+    """
+    Build a list of human-readable tags that mirror the slug, but with
+    full-length key=value text for easier filtering in the W&B UI.
+    """
+    tags: list[str] = []
+
+    # Generic / shared
+    tags.append(f"variant={cfg.variant}")
+
+    if getattr(cfg, "data", None) is not None and getattr(cfg.data, "dataset_name", None) is not None:
+        tags.append(f"dataset={cfg.data.dataset_name}")
+
+    tags.append(f"batch_size={cfg.dataloader.batch_size}")
+    tags.append(f"num_epochs={cfg.optim.num_epochs}")
+    tags.append(f"learning_rate={cfg.optim.learning_rate}")
+    tags.append(f"weight_decay={cfg.optim.weight_decay}")
+    tags.append(f"fp16_precision={cfg.optim.fp16_precision}")
+    tags.append(f"world_size={world_size}")
+
+    # Model architecture
+    m = cfg.model
+    tags.append(f"image_size={m.image_size}")
+    tags.append(f"patch_size={m.patch_size}")
+    tags.append(f"hidden_dim={m.hidden_dim}")
+    tags.append(f"depth={m.depth}")
+    tags.append(f"heads={m.heads}")
+    tags.append(f"predictor_depth={m.predictor_depth}")
+    tags.append(f"predictor_heads={m.predictor_heads}")
+    tags.append(f"num_targets={m.num_targets}")
+
+    # Gating-specific tags
+    if cfg.variant == "gated":
+        tags.append(f"lambda_gates={m.lambda_gates}")
+        tags.append(f"gate_exp_alpha={m.gate_exp_alpha}")
+        tags.append(f"gate_layer_index={m.gate_layer_index}")
+        tags.append(f"gate_location={m.gate_location}")
+        tags.append(f"gate_beta={m.gate_beta}")
+        tags.append(f"gate_gamma={m.gate_gamma}")
+        tags.append(f"gate_zeta={m.gate_zeta}")
+
+    return tags
 
 
 def init_wandb(
@@ -136,6 +179,9 @@ def init_wandb(
     run_name_override = getattr(cfg.logging, "wandb_run_name", None)
     run_name = run_name_override or make_run_slug(cfg)
 
+    # Build tags that mirror the slug but are full text
+    run_tags = make_run_tags(cfg, world_size=world_size)
+
     # Convert the config (DictConfig or dataclass) to a nested dict for W&B
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
@@ -144,22 +190,23 @@ def init_wandb(
         cfg_dict.setdefault("distributed", {})
         cfg_dict["distributed"]["world_size"] = world_size
 
-    # Login into W&B
-    wandb.login(key=os.environ.get("WANDB_API_KEY"))
+    wandb.login(key=os.environ.get("WANDB_API_KEY", ""))
 
     run = wandb.init(
         project=project,
         entity=entity,
         name=run_name,
         config=cfg_dict,
+        tags=run_tags,
     )
 
     if logger is not None:
         logger.info(
-            "Initialized Weights & Biases run: entity=%s, project=%s, name=%s",
+            "Initialized Weights & Biases run: entity=%s, project=%s, name=%s, tags=%s",
             entity,
             project,
             run.name,
+            ", ".join(run_tags),
         )
 
     return run
