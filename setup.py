@@ -35,6 +35,8 @@ setup(
         'torchinfo>=1.8.0',
         'hydra-core>=1.3.2',
         'wandb>=0.23.0',
+        'einops>=0.8.1',
+        'scikit-learn>=1.7.2'
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

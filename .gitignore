@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.sbatch
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -172,3 +173,4 @@ notebooks
 images
 outputs
 wandb
+sbatch_logs
