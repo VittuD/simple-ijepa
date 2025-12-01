@@ -12,7 +12,7 @@ The baseline model was pre-trained on 100,000 unlabeled images from the `STL-10`
 
 Linear probing is done with scikit-learn’s `LogisticRegression` (wrapped in a `CalibratedClassifierCV`), using features from the encoder at image resolution `96x96`.
 
-More detailed evaluation steps and results for [STL10](https://github.com/filipbasara0/simple-ijepa/blob/main/notebooks/linear-probing-stl.ipynb) can be found in the `notebooks/` directory. 
+More detailed evaluation steps and results for [STL10](https://github.com/filipbasara0/simple-ijepa/blob/main/notebooks/linear-probing-stl.ipynb) can be found in the `notebooks/` directory of the original repo. 
 
 | Dataset | Approach | Encoder           | Emb. dim | Patch size | Num. targets | Batch size | Epochs | Top 1% |
 |---------|----------|-------------------|----------|------------|--------------|------------|--------|--------|
@@ -35,7 +35,7 @@ The mask generator in the baseline I-JEPA variant is inspired by the original pa
 
 To setup the code, clone the repository, optionally create a venv and install the package:
 
-1. `git clone git@github.com:filipbasara0/simple-ijepa.git`
+1. `git clone https://github.com/VittuD/simple-ijepa.git`
 2. `cd simple-ijepa`
 3. Create virtual environment: `virtualenv -p python3.10 env`
 4. Activate virtual environment: `source env/bin/activate`
