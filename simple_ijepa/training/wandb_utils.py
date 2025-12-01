@@ -380,14 +380,14 @@ def log_debug_artifacts(
             debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_sim")
             os.makedirs(debug_dir, exist_ok=True)
 
-            ssim_png_path = os.path.join(
+            sim_png_path = os.path.join(
                 debug_dir, f"{step_str}_token_metric_grid.png"
             )
 
             # cosine similarity grid
             save_sim_heatmap_grid(
                 tokens_batch,
-                ssim_png_path,
+                sim_png_path,
                 metric_fn=cosine_sim_matrix,
             )
 
@@ -401,7 +401,7 @@ def log_debug_artifacts(
             if wandb is not None:
                 wandb_run.log(
                     {
-                        "debug/token_sim_grid": wandb.Image(ssim_png_path),
+                        "debug/token_sim_grid": wandb.Image(sim_png_path),
                     },
                     step=step,
                 )

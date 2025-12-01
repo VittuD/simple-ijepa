@@ -328,7 +328,7 @@ class IJEPATrainerDDP:
                     ddp_model, batch, device, cfg.optim.fp16_precision
                 )
 
-                # Gated-only debug visualizations (masks + SSIM + W&B artifacts)
+                # Gated-only debug visualizations (masks + SIM + W&B artifacts)
                 if (
                     cfg.variant == "gated"
                     and cfg.debug.save_debug_masks

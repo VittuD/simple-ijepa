@@ -34,8 +34,8 @@ class IJEPAConfig:
     # Gating-specific controls (used only when variant == "gated")
     lambda_gates: float = 1.0
     gate_exp_alpha: float = 4.0
-    gate_layer_index: Optional[int] = None
-    gate_location: str = "post"
+    gate_layer_index: Optional[int] = None # Indexed from 0; None = last layer
+    gate_location: str = "post" # attn, skip, post (see GatedIJEPA docstring) 
 
     # Hard-concrete gate hyperparameters (used by GatedIJEPA -> HardConcreteGate)
     gate_beta: float = 2.0 / 3.0
