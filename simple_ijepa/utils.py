@@ -2,7 +2,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 import torch.nn.functional as F
 import torch
-import math, warnings, os
+import math, warnings, os, logging
 import numpy as np
 from PIL import Image
 from typing import Callable, Optional
@@ -739,3 +739,161 @@ def save_sim_heatmap_grid(
 
     img = Image.fromarray(combined, mode="L")
     img.save(out_path)
+
+
+def append_debug_record(
+    pt_path: str,
+    record: dict,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Append a single debug `record` (dict) to a .pt file at `pt_path`.
+
+    The file will contain a list[dict]. If an older file is a single dict,
+    it will be wrapped into a list for backward compatibility.
+    """
+    try:
+        if os.path.exists(pt_path):
+            existing = torch.load(pt_path, map_location="cpu")
+            if isinstance(existing, dict):
+                existing = [existing]
+            elif not isinstance(existing, list):
+                # Weird legacy content; wrap it
+                existing = [existing]
+        else:
+            existing = []
+
+        existing.append(record)
+        torch.save(existing, pt_path)
+    except Exception as e:
+        if logger is not None:
+            logger.warning("Failed to append debug record to %s: %s", pt_path, e)
+
+
+def save_mask_debug_step(
+    *,
+    images: torch.Tensor,
+    gate_values_full: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    image_size: int,
+    patch_size: int,
+    max_images: int = 8,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[str, Optional[dict]]:
+    """
+    Convenience wrapper around `save_debug_masks` that also prepares a
+    debug record dict suitable for saving to a .pt file.
+
+    Returns:
+        combined_path: PNG path for the orig/masked grid.
+        record:        dict with tensor data and metadata, or None if
+                       num_to_save == 0.
+    """
+    # Save PNG (this also ensures debug_masks/ exists).
+    combined_path = save_debug_masks(
+        images=images,
+        gate_values_full=gate_values_full,
+        epoch=epoch,
+        global_step=global_step,
+        save_root=save_root,
+        image_size=image_size,
+        patch_size=patch_size,
+        max_images=max_images,
+    )
+
+    if logger is not None:
+        logger.info(
+            "Saved combined debug masks for epoch %d, step %d under %s/debug_masks",
+            epoch + 1,
+            global_step + 1,
+            save_root,
+        )
+
+    B = images.shape[0]
+    if isinstance(gate_values_full, torch.Tensor):
+        G = gate_values_full.shape[0]
+    else:
+        G = B  # fallback
+
+    num_to_save = max(0, min(max_images, B, G))
+
+    if num_to_save <= 0:
+        return combined_path, None
+
+    record = {
+        "epoch": epoch + 1,
+        "global_step": global_step + 1,  # 1-based for readability
+        "png_path": combined_path,
+        "images": images[:num_to_save].detach().cpu(),  # (K, C, H, W)
+        "gate_values_full": (
+            gate_values_full[:num_to_save].detach().cpu()
+            if isinstance(gate_values_full, torch.Tensor)
+            else gate_values_full
+        ),
+        "image_size": image_size,
+        "patch_size": patch_size,
+    }
+
+    return combined_path, record
+
+
+def save_token_sim_debug_step(
+    *,
+    tokens_batch: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    logger: Optional[logging.Logger] = None,
+    scale: int = 4,
+    pad_width: int = 4,
+    pad_value: float = 0.2,
+    max_cols: int = 8,
+) -> tuple[str, Optional[dict]]:
+    """
+    Convenience wrapper around `save_sim_heatmap_grid` that:
+      - builds the debug_ssim directory & filename
+      - saves the PNG grid
+      - prepares a dict suitable for saving to a .pt file.
+
+    Returns:
+        png_path: PNG path for the token similarity grid.
+        record:   dict with token batch + metadata, or None.
+    """
+    debug_dir = os.path.join(save_root, "debug_ssim")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
+    ssim_png_path = os.path.join(debug_dir, f"{step_str}_token_metric_grid.png")
+
+    # Use cosine_sim_matrix by default if metric_fn is None
+    save_sim_heatmap_grid(
+        tokens_batch,
+        ssim_png_path,
+        metric_fn=metric_fn,
+        scale=scale,
+        pad_width=pad_width,
+        pad_value=pad_value,
+        max_cols=max_cols,
+        value_range=None,
+    )
+
+    if logger is not None:
+        logger.info(
+            "Saved token similarity grid for epoch %d, step %d under %s",
+            epoch + 1,
+            global_step + 1,
+            debug_dir,
+        )
+
+    # tokens_batch is expected to be a Tensor; detach & move to CPU for storage
+    record = {
+        "epoch": epoch + 1,
+        "global_step": global_step + 1,
+        "png_path": ssim_png_path,
+        "tokens_batch": tokens_batch.detach().cpu(),  # (K, N, D)
+    }
+
+    return ssim_png_path, record

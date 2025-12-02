@@ -11,9 +11,9 @@ import torch
 from omegaconf import OmegaConf
 
 from simple_ijepa.utils import (
-    save_debug_masks,
-    save_sim_heatmap_grid,
-    cosine_sim_matrix,
+    save_mask_debug_step,
+    save_token_sim_debug_step,
+    append_debug_record,
 )
 
 
@@ -340,13 +340,14 @@ def log_debug_artifacts(
             wandb = None
 
     # -------------------
-    # 1) Patch masks (single combined image + .pt with tensors)
+    # 1) Patch masks (PNG per step + append to one .pt file)
     # -------------------
     if "gate_values_full" in stats:
         try:
             gate_values_full = stats["gate_values_full"]
-            # Save PNG grid
-            combined_path = save_debug_masks(
+            max_images = 8
+
+            combined_path, record = save_mask_debug_step(
                 images=images,
                 gate_values_full=gate_values_full,
                 epoch=epoch,
@@ -354,42 +355,19 @@ def log_debug_artifacts(
                 save_root=cfg.logging.save_model_dir,
                 image_size=model_cfg.image_size,
                 patch_size=model_cfg.patch_size,
-                max_images=8,
-            )
-            logger.info(
-                "Saved combined debug masks for epoch %d, step %d under %s/debug_masks",
-                epoch + 1,
-                global_step + 1,
-                cfg.logging.save_model_dir,
+                max_images=max_images,
+                logger=logger,
             )
 
-            # Save .pt with the raw tensors used for the mask visualization
-            # (slice to match max_images)
-            max_images = 8
-            B = images.shape[0]
-            if isinstance(gate_values_full, torch.Tensor):
-                G = gate_values_full.shape[0]
-            else:
-                G = B  # fallback, should not really happen
+            # Append to a single .pt file with all mask debug records
+            if record is not None:
+                mask_debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_masks")
+                os.makedirs(mask_debug_dir, exist_ok=True)
+                mask_pt_path = os.path.join(mask_debug_dir, "debug_masks_all.pt")
 
-            num_to_save = max(0, min(max_images, B, G))
-            if num_to_save > 0:
-                mask_pt_path = os.path.splitext(combined_path)[0] + ".pt"
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "global_step": step,
-                        "images": images[:num_to_save].detach().cpu(),
-                        "gate_values_full": gate_values_full[:num_to_save].detach().cpu()
-                        if isinstance(gate_values_full, torch.Tensor)
-                        else gate_values_full,
-                        "image_size": model_cfg.image_size,
-                        "patch_size": model_cfg.patch_size,
-                    },
-                    mask_pt_path,
-                )
+                append_debug_record(mask_pt_path, record, logger=logger)
                 logger.info(
-                    "Saved mask debug tensors (.pt) for epoch %d, step %d to %s",
+                    "Appended mask debug record for epoch %d, step %d to %s",
                     epoch + 1,
                     global_step + 1,
                     mask_pt_path,
@@ -406,50 +384,32 @@ def log_debug_artifacts(
             logger.warning("Failed to save/log debug masks: %s", e)
 
     # -------------------
-    # 2) Token sim heatmap grid (PNG + .pt with tokens)
+    # 2) Token sim heatmap grid (PNG per step + append to one .pt file)
     # -------------------
     if "gate_mlp_input_examples" in stats:
         try:
-            from simple_ijepa.utils import cosine_sim_matrix, save_sim_heatmap_grid
-
             tokens_batch = stats["gate_mlp_input_examples"]  # (K, N, D)
-            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
-            os.makedirs(debug_dir, exist_ok=True)
 
-            ssim_png_path = os.path.join(
-                debug_dir, f"{step_str}_token_metric_grid.png"
+            ssim_png_path, record = save_token_sim_debug_step(
+                tokens_batch=tokens_batch,
+                epoch=epoch,
+                global_step=global_step,
+                save_root=cfg.logging.save_model_dir,
+                logger=logger,
             )
 
-            # cosine similarity grid
-            save_sim_heatmap_grid(
-                tokens_batch,
-                ssim_png_path,
-                metric_fn=cosine_sim_matrix,
-            )
+            # Append token batch to a single .pt file
+            if record is not None:
+                debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
+                os.makedirs(debug_dir, exist_ok=True)
+                sim_pt_path = os.path.join(debug_dir, "token_metrics_all.pt")
 
-            logger.info(
-                "Saved token similarity grid for epoch %d, step %d under %s",
-                epoch + 1,
-                global_step + 1,
-                debug_dir,
-            )
-
-            # Save .pt with the raw tokens used to compute these grids
-            if isinstance(tokens_batch, torch.Tensor):
-                ssim_pt_path = os.path.splitext(ssim_png_path)[0] + ".pt"
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "global_step": step,
-                        "tokens_batch": tokens_batch.detach().cpu(),  # (K, N, D)
-                    },
-                    ssim_pt_path,
-                )
+                append_debug_record(sim_pt_path, record, logger=logger)
                 logger.info(
-                    "Saved token similarity debug tensors (.pt) for epoch %d, step %d to %s",
+                    "Appended token similarity debug record for epoch %d, step %d to %s",
                     epoch + 1,
                     global_step + 1,
-                    ssim_pt_path,
+                    sim_pt_path,
                 )
 
             if wandb is not None:
