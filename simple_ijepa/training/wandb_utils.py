@@ -340,13 +340,15 @@ def log_debug_artifacts(
             wandb = None
 
     # -------------------
-    # 1) Patch masks (single combined image)
+    # 1) Patch masks (single combined image + .pt with tensors)
     # -------------------
     if "gate_values_full" in stats:
         try:
+            gate_values_full = stats["gate_values_full"]
+            # Save PNG grid
             combined_path = save_debug_masks(
                 images=images,
-                gate_values_full=stats["gate_values_full"],
+                gate_values_full=gate_values_full,
                 epoch=epoch,
                 global_step=global_step,
                 save_root=cfg.logging.save_model_dir,
@@ -361,6 +363,38 @@ def log_debug_artifacts(
                 cfg.logging.save_model_dir,
             )
 
+            # Save .pt with the raw tensors used for the mask visualization
+            # (slice to match max_images)
+            max_images = 8
+            B = images.shape[0]
+            if isinstance(gate_values_full, torch.Tensor):
+                G = gate_values_full.shape[0]
+            else:
+                G = B  # fallback, should not really happen
+
+            num_to_save = max(0, min(max_images, B, G))
+            if num_to_save > 0:
+                mask_pt_path = os.path.splitext(combined_path)[0] + ".pt"
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "global_step": step,
+                        "images": images[:num_to_save].detach().cpu(),
+                        "gate_values_full": gate_values_full[:num_to_save].detach().cpu()
+                        if isinstance(gate_values_full, torch.Tensor)
+                        else gate_values_full,
+                        "image_size": model_cfg.image_size,
+                        "patch_size": model_cfg.patch_size,
+                    },
+                    mask_pt_path,
+                )
+                logger.info(
+                    "Saved mask debug tensors (.pt) for epoch %d, step %d to %s",
+                    epoch + 1,
+                    global_step + 1,
+                    mask_pt_path,
+                )
+
             if wandb is not None:
                 wandb_run.log(
                     {
@@ -372,22 +406,24 @@ def log_debug_artifacts(
             logger.warning("Failed to save/log debug masks: %s", e)
 
     # -------------------
-    # 2) Token sim heatmap grid (first up to 8 examples)
+    # 2) Token sim heatmap grid (PNG + .pt with tokens)
     # -------------------
     if "gate_mlp_input_examples" in stats:
         try:
+            from simple_ijepa.utils import cosine_sim_matrix, save_sim_heatmap_grid
+
             tokens_batch = stats["gate_mlp_input_examples"]  # (K, N, D)
-            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_sim")
+            debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
             os.makedirs(debug_dir, exist_ok=True)
 
-            sim_png_path = os.path.join(
+            ssim_png_path = os.path.join(
                 debug_dir, f"{step_str}_token_metric_grid.png"
             )
 
             # cosine similarity grid
             save_sim_heatmap_grid(
                 tokens_batch,
-                sim_png_path,
+                ssim_png_path,
                 metric_fn=cosine_sim_matrix,
             )
 
@@ -398,10 +434,28 @@ def log_debug_artifacts(
                 debug_dir,
             )
 
+            # Save .pt with the raw tokens used to compute these grids
+            if isinstance(tokens_batch, torch.Tensor):
+                ssim_pt_path = os.path.splitext(ssim_png_path)[0] + ".pt"
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "global_step": step,
+                        "tokens_batch": tokens_batch.detach().cpu(),  # (K, N, D)
+                    },
+                    ssim_pt_path,
+                )
+                logger.info(
+                    "Saved token similarity debug tensors (.pt) for epoch %d, step %d to %s",
+                    epoch + 1,
+                    global_step + 1,
+                    ssim_pt_path,
+                )
+
             if wandb is not None:
                 wandb_run.log(
                     {
-                        "debug/token_sim_grid": wandb.Image(sim_png_path),
+                        "debug/token_sim_grid": wandb.Image(ssim_png_path),
                     },
                     step=step,
                 )
