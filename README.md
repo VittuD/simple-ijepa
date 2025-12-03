@@ -218,14 +218,12 @@ The trainer saves:
 
 | Key                    | Default | Description                                                                                             |
 |------------------------|---------|---------------------------------------------------------------------------------------------------------|
-| debug.save_debug_masks | `false` | If `true` and `variant="gated"`, rank 0 saves patch-masked image visualizations and SSIM heatmaps.     |
+| debug.save_debug_masks | `false` | If `true` and `variant="gated"`, rank 0 saves patch-masked image visualizations and Similarity heatmaps.     |
 
 When enabled, the trainer:
 
 * Saves original vs masked images using the current gate values into `save_model_dir/debug_masks/`.
-* Computes an SSIM-style similarity matrix between the gate-MLP input tokens and saves:
-  * `debug_ssim/*_token_ssim.pt`
-  * `debug_ssim/*_token_ssim.png`
+* Computes Cosine Similarity matrix between the gate-MLP input tokens.
 
 ---
 
