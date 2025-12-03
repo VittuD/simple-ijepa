@@ -16,7 +16,6 @@ from simple_ijepa.ijepa import IJEPA
 from simple_ijepa.ijepa_gated import GatedIJEPA
 from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import (
-    update_gamma,
     training_transforms,
     compute_global_grad_norm,
     compute_global_param_norm,
@@ -40,6 +39,7 @@ from simple_ijepa.training.dist_utils import (
     setup_distributed,
     setup_logging,
 )
+from simple_ijepa.training.schedulers import get_scheduler
 
 
 SEED = 42
@@ -290,6 +290,14 @@ class IJEPATrainerDDP:
         )
 
         total_num_steps = (len(train_loader) * (cfg.optim.num_epochs + 2)) - cfg.ema.update_gamma_after_step
+
+        # EMA gamma cosine schedule from cfg.ema.gamma -> 1.0
+        ema_scheduler = get_scheduler(
+            name="ema_cosine",
+            num_training_steps=total_num_steps,
+            ema_base_gamma=cfg.ema.gamma,
+        )
+
         gamma = cfg.ema.gamma
         global_step = 0
         total_loss = 0.0
@@ -372,8 +380,9 @@ class IJEPATrainerDDP:
                     global_step > cfg.ema.update_gamma_after_step
                     and global_step % cfg.ema.update_gamma_every_n_steps == 0
                 ):
+                    # Compute gamma from the EMA scheduler, then apply EMA
+                    gamma = ema_scheduler(global_step)
                     ddp_model.module.update_params(gamma)
-                    gamma = update_gamma(global_step, total_num_steps, cfg.ema.gamma)
 
                 if global_step <= cfg.ema.update_gamma_after_step:
                     ddp_model.module.copy_params()

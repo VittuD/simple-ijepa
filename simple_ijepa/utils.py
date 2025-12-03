@@ -87,16 +87,6 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
         return _trunc_normal_(tensor, mean, std, a, b)
 
 
-# cosine EMA schedule (increase from tau_base to one) as defined in https://arxiv.org/abs/2010.07922
-# k -> current training step, K -> maximum number of training steps
-def update_gamma(k, K, tau_base):
-    k = torch.tensor(k, dtype=torch.float32)
-    K = torch.tensor(K, dtype=torch.float32)
-
-    tau = 1 - (1 - tau_base) * (torch.cos(torch.pi * k / K) + 1) / 2
-    return tau.item()
-
-
 # -----------------------------
 # Gated-specific utilities
 # -----------------------------
