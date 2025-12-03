@@ -193,6 +193,8 @@ class IJEPATrainerDDP:
             sampler=train_sampler,
             num_workers=cfg.dataloader.num_workers,
             pin_memory=True,
+            persistent_workers=(cfg.dataloader.num_workers > 0),
+            prefetch_factor=4,
         )
         if cfg.variant == "baseline":
             loader_kwargs["collate_fn"] = collate_fn

@@ -32,8 +32,15 @@ def logistic_regression(
     X_train, X_test = embeddings, embeddings_val
     y_train, y_test = labels, labels_val
 
-    clf = LogisticRegression(max_iter=100)
-    clf = CalibratedClassifierCV(clf)
+    clf = LogisticRegression(
+        max_iter=100,
+        n_jobs=-1,      # use all available threads
+        solver="lbfgs", # default; included here just to be explicit
+    )
+    clf = CalibratedClassifierCV(
+        clf,
+        n_jobs=-1,      # parallelize CV calibration
+    )
 
     clf.fit(X_train, y_train)
 
@@ -82,8 +89,8 @@ class STL10Eval:
             download=True,
         )
 
-        self.train_loader = DataLoader(train_ds, batch_size=64, num_workers=2)
-        self.val_loader = DataLoader(val_ds, batch_size=64, num_workers=2)
+        self.train_loader = DataLoader(train_ds, batch_size=1024, num_workers=8, pin_memory=True)
+        self.val_loader = DataLoader(val_ds, batch_size=1024, num_workers=8, pin_memory=True)
 
     @torch.inference_mode
     def evaluate(self, ijepa_model, global_step: Optional[int] = None, prefix: str = "eval"):
@@ -111,7 +118,7 @@ class STL10Eval:
         embs, labels = [], []
         for _, (images, targets) in enumerate(dataloader):
             with torch.no_grad():
-                images = images.to(self.device)
+                images = images.to(self.device, non_blocking=True)
                 out = model(images)
                 features = out.cpu().detach()
                 features = features.mean(dim=1)
