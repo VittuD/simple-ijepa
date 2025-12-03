@@ -400,7 +400,7 @@ def log_debug_artifacts(
 
             # Append token batch to a single .pt file
             if record is not None:
-                debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_ssim")
+                debug_dir = os.path.join(cfg.logging.save_model_dir, "debug_sim")
                 os.makedirs(debug_dir, exist_ok=True)
                 sim_pt_path = os.path.join(debug_dir, "token_metrics_all.pt")
 

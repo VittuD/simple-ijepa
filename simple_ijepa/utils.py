@@ -854,7 +854,7 @@ def save_token_sim_debug_step(
 ) -> tuple[str, Optional[dict]]:
     """
     Convenience wrapper around `save_sim_heatmap_grid` that:
-      - builds the debug_ssim directory & filename
+      - builds the debug_sim directory & filename
       - saves the PNG grid
       - prepares a dict suitable for saving to a .pt file.
 
@@ -862,7 +862,7 @@ def save_token_sim_debug_step(
         png_path: PNG path for the token similarity grid.
         record:   dict with token batch + metadata, or None.
     """
-    debug_dir = os.path.join(save_root, "debug_ssim")
+    debug_dir = os.path.join(save_root, "debug_sim")
     os.makedirs(debug_dir, exist_ok=True)
 
     step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
@@ -897,3 +897,96 @@ def save_token_sim_debug_step(
     }
 
     return ssim_png_path, record
+
+
+# -----------------------------
+# Optimization / monitoring utils
+# -----------------------------
+def compute_global_grad_norm(model) -> float:
+    """
+    Compute the global L2 norm of gradients over all parameters of `model`.
+
+    Returns:
+        float: sqrt(sum_i ||grad_i||^2) over all parameters with non-None grad.
+               Returns 0.0 if no gradients are present.
+    """
+    total_sq = 0.0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        param_norm = grad.norm(2)
+        total_sq += float(param_norm) ** 2
+
+    if total_sq == 0.0:
+        return 0.0
+    return float(math.sqrt(total_sq))
+
+
+def compute_global_param_norm(model) -> float:
+    """
+    Compute the global L2 norm of parameters of `model`.
+
+    Returns:
+        float: sqrt(sum_i ||param_i||^2) over all parameters.
+               Returns 0.0 if there are no parameters.
+    """
+    total_sq = 0.0
+    for p in model.parameters():
+        data = p.detach()
+        param_norm = data.norm(2)
+        total_sq += float(param_norm) ** 2
+
+    if total_sq == 0.0:
+        return 0.0
+    return float(math.sqrt(total_sq))
+
+
+# -----------------------------
+# Gating statistics helpers
+# -----------------------------
+def summarize_open_fraction(open_frac_per_sample: torch.Tensor) -> dict:
+    """
+    Given a tensor of shape (B,) with per-sample expected open fractions,
+    return simple summary stats as Python floats.
+    """
+    if not isinstance(open_frac_per_sample, torch.Tensor):
+        open_frac_per_sample = torch.as_tensor(open_frac_per_sample)
+
+    if open_frac_per_sample.numel() == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+    # Use unbiased=False so std is well-defined even for B == 1
+    mean = open_frac_per_sample.mean().item()
+    std = open_frac_per_sample.std(unbiased=False).item()
+    min_val = open_frac_per_sample.min().item()
+    max_val = open_frac_per_sample.max().item()
+
+    return {
+        "mean": mean,
+        "std": std,
+        "min": min_val,
+        "max": max_val,
+    }
+
+
+def summarize_gate_values(gate_values_full: torch.Tensor) -> dict:
+    """
+    Given a tensor of gate values of shape (B, N) in [0, 1],
+    compute summary stats over all gates in the batch.
+    """
+    if not isinstance(gate_values_full, torch.Tensor):
+        gate_values_full = torch.as_tensor(gate_values_full)
+
+    if gate_values_full.numel() == 0:
+        return {"mean": 0.0, "std": 0.0}
+
+    flat = gate_values_full.view(-1)
+
+    mean = flat.mean().item()
+    std = flat.std(unbiased=False).item()
+
+    return {
+        "mean": mean,
+        "std": std,
+    }

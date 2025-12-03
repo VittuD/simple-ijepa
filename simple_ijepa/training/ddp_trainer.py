@@ -18,6 +18,10 @@ from simple_ijepa.stl10_eval import STL10Eval
 from simple_ijepa.utils import (
     update_gamma,
     training_transforms,
+    compute_global_grad_norm,
+    compute_global_param_norm,
+    summarize_open_fraction,
+    summarize_gate_values,
 )
 from simple_ijepa.dataset import MaskedImageDataset, collate_fn
 
@@ -351,6 +355,15 @@ class IJEPATrainerDDP:
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
+
+                # Unscale gradients (if enabled) so grad norms are in the true scale
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+
+                # Compute global norms BEFORE the optimizer step, for both variants
+                grad_norm = compute_global_grad_norm(ddp_model.module)
+                param_norm = compute_global_param_norm(ddp_model.module)
+
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -375,6 +388,7 @@ class IJEPATrainerDDP:
 
                 if rank == 0:
                     current_lr = optimizer.param_groups[0]["lr"]
+                    current_weight_decay = optimizer.param_groups[0].get("weight_decay", 0.0)
 
                     if cfg.variant == "baseline":
                         desc = (
@@ -382,24 +396,44 @@ class IJEPATrainerDDP:
                             f"Step {global_step+1} | "
                             f"Epoch Loss: {ep_loss:.7f} | "
                             f"Total Loss: {avg_loss:.7f} | "
-                            f"EMA gamma: {gamma:.6f} | "
-                            f"Lr: {current_lr:.6f}"
+                            f"EMA γ: {gamma:.6f} | "
+                            f"Lr: {current_lr:.6f} | "
+                            f"gN: {grad_norm:.2e} | "
+                            f"pN: {param_norm:.2e}"
                         )
 
                         metrics = {
+                            # Training progress
                             "train/epoch": epoch + 1,
                             "train/global_step": global_step + 1,
                             "train/loss_step": loss_value,
                             "train/loss_epoch": ep_loss,
                             "train/loss_avg": avg_loss,
-                            "train/ema_gamma": gamma,
-                            "train/lr": current_lr,
+                            # Optimization-related
+                            "optim/ema_gamma": gamma,
+                            "optim/lr": current_lr,
+                            "optim/grad_norm_global": grad_norm,
+                            "optim/param_norm_global": param_norm,
+                            "optim/weight_decay": current_weight_decay,
                         }
                     else:
                         pred_loss = stats["pred_loss"].item()
                         gate_penalty = stats["gate_penalty"].item()
                         open_prob_mean = stats["open_prob_mean"].item()
                         closed_prob_mean = stats["closed_prob_mean"].item()
+
+                        # Extra gated stats
+                        open_frac_stats = {}
+                        gate_value_stats = {}
+                        if isinstance(stats, dict):
+                            open_frac_tensor = stats.get("open_frac_per_sample")
+                            gate_values_full = stats.get("gate_values_full")
+
+                            if isinstance(open_frac_tensor, torch.Tensor):
+                                open_frac_stats = summarize_open_fraction(open_frac_tensor)
+
+                            if isinstance(gate_values_full, torch.Tensor):
+                                gate_value_stats = summarize_gate_values(gate_values_full)
 
                         desc = (
                             f"Epoch {epoch+1}/{cfg.optim.num_epochs} | "
@@ -411,22 +445,49 @@ class IJEPATrainerDDP:
                             f"Open: {open_prob_mean*100:.1f}% | "
                             f"Closed: {closed_prob_mean*100:.1f}% | "
                             f"EMA γ: {gamma:.4f} | "
-                            f"Lr: {current_lr:.6f}"
+                            f"Lr: {current_lr:.6f} | "
+                            f"gN: {grad_norm:.2e} | "
+                            f"pN: {param_norm:.2e}"
                         )
 
                         metrics = {
+                            # Training progress
                             "train/epoch": epoch + 1,
                             "train/global_step": global_step + 1,
                             "train/loss_step": loss_value,
                             "train/loss_epoch": ep_loss,
                             "train/loss_avg": avg_loss,
-                            "train/ema_gamma": gamma,
-                            "train/lr": current_lr,
+                            # Optimization-related
+                            "optim/ema_gamma": gamma,
+                            "optim/lr": current_lr,
+                            "optim/grad_norm_global": grad_norm,
+                            "optim/param_norm_global": param_norm,
+                            "optim/weight_decay": current_weight_decay,
+                            # Gating metrics (existing)
                             "gates/pred_loss": pred_loss,
                             "gates/gate_penalty": gate_penalty,
                             "gates/open_prob_mean": open_prob_mean,
                             "gates/closed_prob_mean": closed_prob_mean,
                         }
+
+                        # Add new gated summaries under gates/*
+                        if open_frac_stats:
+                            metrics.update(
+                                {
+                                    "gates/open_frac_mean": open_frac_stats["mean"],
+                                    "gates/open_frac_std": open_frac_stats["std"],
+                                    "gates/open_frac_min": open_frac_stats["min"],
+                                    "gates/open_frac_max": open_frac_stats["max"],
+                                }
+                            )
+
+                        if gate_value_stats:
+                            metrics.update(
+                                {
+                                    "gates/gate_value_mean": gate_value_stats["mean"],
+                                    "gates/gate_value_std": gate_value_stats["std"],
+                                }
+                            )
 
                     # Show progress in-place on console
                     progress_bar.set_description(desc)
