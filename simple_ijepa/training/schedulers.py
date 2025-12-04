@@ -2,13 +2,24 @@
 """
 Learning rate & EMA schedulers in a HuggingFace-style API.
 
+All LR schedulers in this module support an *optional linear warmup*:
+
+    - `num_warmup_steps` (int, default = 0):
+        * If 0: no warmup, the schedule starts at full LR (scale 1.0).
+        * If > 0: LR scale ramps linearly from 0.0 → 1.0 over the first
+          `num_warmup_steps` optimizer steps.
+
+After warmup, each scheduler applies its own decay rule.
+
 - LR schedulers (return torch.optim.lr_scheduler.LambdaLR):
-    * "linear"
-    * "cosine"
-    * "step"
+    * "constant"   -> constant LR after warmup
+    * "linear"     -> linear decay to 0 after warmup
+    * "cosine"     -> cosine decay after warmup
+    * "step"       -> stepwise multiplicative decay after warmup
 
 - EMA scheduler (returns a callable step -> gamma):
-    * "ema_cosine"
+    * "ema_cosine" -> cosine schedule for EMA coefficient (no warmup here;
+                     EMA warmup is controlled by the training loop).
 """
 
 from __future__ import annotations
@@ -20,16 +31,38 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
 
-LRSchedulerName = Literal["linear", "cosine", "step"]
+LRSchedulerName = Literal["constant", "linear", "cosine", "step"]
 EMASchedulerName = Literal["ema_cosine"]
-SchedulerName = Literal["linear", "cosine", "step", "ema_cosine"]
+SchedulerName = Literal["constant", "linear", "cosine", "step", "ema_cosine"]
 
 SchedulerReturn = Union[LambdaLR, Callable[[int], float]]
 
 
 # ---------------------------------------------------------------------------
-# LR schedulers with warmup
+# LR schedulers (all with optional linear warmup)
 # ---------------------------------------------------------------------------
+
+def get_constant_schedule_with_warmup(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+) -> LambdaLR:
+    """
+    Constant LR after an optional linear warmup.
+    """
+    if num_warmup_steps < 0:
+        raise ValueError(f"`num_warmup_steps` must be >= 0, got {num_warmup_steps}.")
+
+    def lr_lambda(current_step: int) -> float:
+        if num_warmup_steps == 0:
+            return 1.0
+
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+
+        return 1.0
+
+    return LambdaLR(optimizer, lr_lambda)
+
 
 def get_step_schedule_with_warmup(
     optimizer: Optimizer,
@@ -40,14 +73,7 @@ def get_step_schedule_with_warmup(
     gamma: float,
 ) -> LambdaLR:
     """
-    Step decay scheduler with a warmup phase.
-
-    Args:
-        optimizer:         Wrapped optimizer.
-        num_warmup_steps:  Warmup steps (linear 0 -> 1).
-        num_training_steps:Total training steps (including warmup).
-        num_steps:         Number of decay events after warmup.
-        gamma:             Multiplicative factor at each decay event.
+    Stepwise multiplicative LR decay after an optional linear warmup.
     """
     if num_training_steps <= 0:
         raise ValueError(f"`num_training_steps` must be > 0, got {num_training_steps}.")
@@ -55,7 +81,7 @@ def get_step_schedule_with_warmup(
         raise ValueError(f"`num_warmup_steps` must be >= 0, got {num_warmup_steps}.")
 
     def lr_lambda(current_step: int) -> float:
-        # Warmup
+        # Linear warmup
         if current_step < num_warmup_steps and num_warmup_steps > 0:
             return float(current_step) / float(max(1, num_warmup_steps))
 
@@ -67,7 +93,7 @@ def get_step_schedule_with_warmup(
         if steps_after_warmup <= 0:
             return 1.0
 
-        # Shift to post-warmup coords
+        # Shift to post-warmup coordinates
         t = max(0, current_step - num_warmup_steps)
 
         step_width = steps_after_warmup / float(num_steps)
@@ -85,7 +111,7 @@ def get_linear_schedule_with_warmup(
     num_training_steps: int,
 ) -> LambdaLR:
     """
-    Classic linear decay with warmup.
+    Linear LR decay to 0 after an optional linear warmup.
     """
     if num_training_steps <= 0:
         raise ValueError(f"`num_training_steps` must be > 0, got {num_training_steps}.")
@@ -93,7 +119,7 @@ def get_linear_schedule_with_warmup(
         raise ValueError(f"`num_warmup_steps` must be >= 0, got {num_warmup_steps}.")
 
     def lr_lambda(current_step: int) -> float:
-        # Warmup
+        # Linear warmup
         if current_step < num_warmup_steps and num_warmup_steps > 0:
             return float(current_step) / float(max(1, num_warmup_steps))
 
@@ -113,7 +139,7 @@ def get_cosine_schedule_with_warmup(
     num_cycles: float = 0.5,
 ) -> LambdaLR:
     """
-    Cosine annealing schedule with warmup.
+    Cosine LR decay after an optional linear warmup.
     """
     if num_training_steps <= 0:
         raise ValueError(f"`num_training_steps` must be > 0, got {num_training_steps}.")
@@ -121,7 +147,7 @@ def get_cosine_schedule_with_warmup(
         raise ValueError(f"`num_warmup_steps` must be >= 0, got {num_warmup_steps}.")
 
     def lr_lambda(current_step: int) -> float:
-        # Warmup
+        # Linear warmup
         if current_step < num_warmup_steps and num_warmup_steps > 0:
             return float(current_step) / float(max(1, num_warmup_steps))
 
@@ -139,7 +165,7 @@ def get_cosine_schedule_with_warmup(
 
 
 # ---------------------------------------------------------------------------
-# EMA scheduler (internal helper)
+# EMA scheduler (internal helper, no LR warmup involved)
 # ---------------------------------------------------------------------------
 
 def _get_ema_cosine_scheduler(
@@ -147,9 +173,13 @@ def _get_ema_cosine_scheduler(
     base_gamma: float,
 ) -> Callable[[int], float]:
     """
-    Cosine schedule for EMA coefficient gamma, matching utils.update_gamma:
+    Cosine schedule for EMA coefficient gamma, matching the previous
+    utils.update_gamma() behavior:
 
         tau_k = 1 - (1 - base_gamma) * (cos(pi * k / K) + 1) / 2
+
+    EMA warmup / start behavior (e.g. "copy params until step N") is handled
+    by the training loop, not by this function.
     """
     if num_training_steps <= 0:
         raise ValueError(f"`num_training_steps` must be > 0, got {num_training_steps}.")
@@ -183,19 +213,24 @@ def get_scheduler(
     """
     Generic factory for LR and EMA schedulers.
 
-    LR schedulers (require `optimizer`):
-        - "linear"
-        - "cosine"
-        - "step"
+    LR schedulers (require `optimizer` and support optional linear warmup):
+        - "constant"  -> constant LR after warmup
+        - "linear"    -> linear decay to 0 after warmup
+        - "cosine"    -> cosine decay after warmup
+        - "step"      -> stepwise multiplicative decay after warmup
 
     EMA scheduler (ignores `optimizer`, returns callable step -> gamma):
-        - "ema_cosine"
-
-    Returns:
-        - For LR: LambdaLR
-        - For EMA: Callable[[int], float]
+        - "ema_cosine" -> cosine schedule in [base_gamma, 1.0]
     """
     # ---- LR schedulers ----
+    if name == "constant":
+        if optimizer is None:
+            raise ValueError("`optimizer` must be provided for 'constant' scheduler.")
+        return get_constant_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+        )
+
     if name == "linear":
         if optimizer is None:
             raise ValueError("`optimizer` must be provided for 'linear' scheduler.")
@@ -242,5 +277,5 @@ def get_scheduler(
 
     raise ValueError(
         f"Unknown scheduler name: {name!r}. "
-        f"Expected one of 'linear', 'cosine', 'step', 'ema_cosine'."
+        f"Expected one of 'constant', 'linear', 'cosine', 'step', 'ema_cosine'."
     )
