@@ -1,5 +1,7 @@
-import torch
+# simple_ijepa/ijepa.py
+
 import copy
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -24,6 +26,8 @@ class BaseIJEPA(nn.Module):
         self.context_encoder = encoder
 
         # Teacher / target encoder (EMA of student, no grad)
+        # NOTE: we deep-copy from the *already-constructed* encoder to avoid
+        # any shape mismatches (e.g. pos_embedding) – no manual state_dict load.
         self.target_encoder = copy.deepcopy(self.context_encoder)
         self.target_encoder.requires_grad_(False)
 
@@ -92,14 +96,16 @@ class BaseIJEPA(nn.Module):
 
 class IJEPA(BaseIJEPA):
 
-    def __init__(self,
-                 encoder,
-                 hidden_emb_dim=512,
-                 img_size=96,
-                 patch_size=8,
-                 num_targets=4,
-                 predictor_depth=6,
-                 predictor_heads=6):
+    def __init__(
+        self,
+        encoder: VisionTransformer,
+        hidden_emb_dim: int = 512,
+        img_size: int = 96,
+        patch_size: int = 8,
+        num_targets: int = 4,
+        predictor_depth: int = 6,
+        predictor_heads: int = 6,
+    ):
         super().__init__(encoder=encoder)
 
         self.patch_size = patch_size
@@ -116,7 +122,7 @@ class IJEPA(BaseIJEPA):
         )
 
         self.mask_token = nn.Parameter(torch.zeros(1, hidden_emb_dim))
-        trunc_normal_(self.mask_token, mean=0., std=.02)
+        trunc_normal_(self.mask_token, mean=0.0, std=0.02)
 
     def forward(self, img, context_indices_list, target_indices_list):
         # Target model processes all patches

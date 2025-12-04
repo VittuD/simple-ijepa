@@ -1,0 +1,875 @@
+from __future__ import annotations
+
+import math
+import os
+import logging
+from typing import Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from PIL import Image
+from torchvision.utils import save_image
+
+
+# -----------------------------
+# Gated predictor encoder wrapper
+# -----------------------------
+
+class GatedPredictorEncoder(nn.Module):
+    """
+    Wraps a GatedIJEPA model to expose a plain encoder interface:
+        forward(x) -> (B, N, D) token embeddings
+
+    mode = "gated":
+        - If gate_layer_index is None:
+            Uses the learned gates on final encoder tokens to mix student
+            tokens and mask token, then runs the predictor.
+        - If gate_layer_index is not None:
+            Reuses the *internal* gating path used during training
+            (gating after the chosen transformer block), then runs the
+            predictor on the final masked tokens.
+
+    mode = "all_open":
+        Uses the raw student tokens (no gating anywhere), then runs the
+        predictor. This is a clean ablation: "what if we never gated?".
+    """
+
+    def __init__(self, ijepa_model, mode: str = "gated"):
+        super().__init__()
+        assert mode in ("gated", "all_open")
+        self.ijepa = ijepa_model
+        self.mode = mode
+
+    @torch.inference_mode
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        m = self.ijepa
+        device = x.device
+
+        # "all_open": no gating, no masking
+        if self.mode == "all_open":
+            student_tokens = m.context_encoder(x)  # plain VisionTransformer
+            context_tokens = student_tokens
+
+        else:  # "gated"
+            depth = len(m.context_encoder.transformer.layers)
+            gate_layer_index = getattr(m, "gate_layer_index", None)
+
+            use_internal_gating = (
+                gate_layer_index is not None
+                and 0 <= gate_layer_index < depth
+            )
+
+            if use_internal_gating:
+                # Use the same internal gating path as in training
+                student_tokens, gate_values, gate_probs, _ = (
+                    m._encode_student_with_internal_gating(x)
+                )
+                context_tokens = student_tokens
+            else:
+                # Original behavior: gate final encoder tokens outside encoder
+                student_tokens = m.context_encoder(x)  # (B, N, D)
+                B, N, D = student_tokens.shape
+
+                log_alpha = m.gate_mlp(student_tokens).squeeze(-1)  # (B, N)
+                log_alpha = torch.clamp(log_alpha, min=-10.0, max=10.0)
+                gate_values, _ = m.gate(log_alpha, training=False)  # (B, N)
+                r = gate_values.unsqueeze(-1)
+
+                mask_token = m.mask_token.to(device)
+                mask_tokens = mask_token.expand(B, N, D)
+                one_minus_r = 1.0 - r
+
+                context_tokens = r * student_tokens + one_minus_r * mask_tokens
+
+        out = m.predictor(
+            context_tokens,
+            patchify=False,
+            pos_embed=False,
+        )
+        out = F.layer_norm(out, (out.size(-1),))
+
+        return out
+
+
+# -----------------------------
+# Mask visualization utilities
+# -----------------------------
+
+def save_debug_masks(
+    images: torch.Tensor,
+    gate_values_full: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    image_size: int,
+    patch_size: int,
+    max_images: int = 8,
+) -> str:
+    """
+    Save a single debug image that contains, for the first few images
+    in the batch:
+
+      - top row: original images
+      - bottom row: patch-masked images (based on gate_values_full)
+
+    Returns:
+        combined_path: path to the saved PNG.
+    """
+    os.makedirs(os.path.join(save_root, "debug_masks"), exist_ok=True)
+    debug_dir = os.path.join(save_root, "debug_masks")
+
+    B, C, H, W = images.shape
+    assert H == image_size and W == image_size, "Unexpected image size."
+
+    num_to_save = min(max_images, B)
+    H_p = image_size // patch_size
+    W_p = image_size // patch_size
+    N = H_p * W_p
+
+    assert gate_values_full.shape[0] == B
+    assert gate_values_full.shape[1] == N, "gate_values_full has wrong length."
+
+    images_cpu = images[:num_to_save].detach().cpu()
+    gates_cpu = gate_values_full[:num_to_save].detach().cpu()  # (K, N)
+
+    masked_images = []
+
+    for idx in range(num_to_save):
+        img = images_cpu[idx].clone()
+        g = gates_cpu[idx]
+
+        gate_map = g.view(H_p, W_p)
+        img_masked = img.clone()
+
+        for ph in range(H_p):
+            for pw in range(W_p):
+                if gate_map[ph, pw] < 0.5:
+                    h0 = ph * patch_size
+                    h1 = h0 + patch_size
+                    w0 = pw * patch_size
+                    w1 = w0 + patch_size
+
+                    img_masked[:, h0:h1, w0:w1] = 0.0
+
+                    size = patch_size
+                    diag = torch.arange(size)
+
+                    img_masked[:, h0 + diag, w0 + diag] = 0.7
+                    img_masked[:, h0 + diag, w1 - 1 - diag] = 0.7
+
+        masked_images.append(img_masked)
+
+    masked_batch = torch.stack(masked_images, dim=0)  # (K, C, H, W)
+
+    # Build a single grid image:
+    #   top row: original
+    #   bottom row: masked
+    combined_batch = torch.cat([images_cpu, masked_batch], dim=0)  # (2K, C, H, W)
+
+    step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
+    combined_path = os.path.join(debug_dir, f"{step_str}_orig_masked.png")
+
+    save_image(
+        combined_batch,
+        combined_path,
+        nrow=num_to_save,           # K columns -> 2 rows
+        normalize=True,
+        value_range=(0.0, 1.0),
+    )
+
+    return combined_path
+
+
+def append_debug_record(
+    pt_path: str,
+    record: dict,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Append a single debug `record` (dict) to a .pt file at `pt_path`.
+
+    The file will contain a list[dict]. If an older file is a single dict,
+    it will be wrapped into a list for backward compatibility.
+    """
+    try:
+        if os.path.exists(pt_path):
+            existing = torch.load(pt_path, map_location="cpu")
+            if isinstance(existing, dict):
+                existing = [existing]
+            elif not isinstance(existing, list):
+                # Weird legacy content; wrap it
+                existing = [existing]
+        else:
+            existing = []
+
+        existing.append(record)
+        torch.save(existing, pt_path)
+    except Exception as e:
+        if logger is not None:
+            logger.warning("Failed to append debug record to %s: %s", pt_path, e)
+
+
+def save_mask_debug_step(
+    *,
+    images: torch.Tensor,
+    gate_values_full: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    image_size: int,
+    patch_size: int,
+    max_images: int = 8,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[str, Optional[dict]]:
+    """
+    Convenience wrapper around `save_debug_masks` that also prepares a
+    debug record dict suitable for saving to a .pt file.
+
+    Returns:
+        combined_path: PNG path for the orig/masked grid.
+        record:        dict with tensor data and metadata, or None if
+                       num_to_save == 0.
+    """
+    # Save PNG (this also ensures debug_masks/ exists).
+    combined_path = save_debug_masks(
+        images=images,
+        gate_values_full=gate_values_full,
+        epoch=epoch,
+        global_step=global_step,
+        save_root=save_root,
+        image_size=image_size,
+        patch_size=patch_size,
+        max_images=max_images,
+    )
+
+    if logger is not None:
+        logger.info(
+            "Saved combined debug masks for epoch %d, step %d under %s/debug_masks",
+            epoch + 1,
+            global_step + 1,
+            save_root,
+        )
+
+    B = images.shape[0]
+    if isinstance(gate_values_full, torch.Tensor):
+        G = gate_values_full.shape[0]
+    else:
+        G = B  # fallback
+
+    num_to_save = max(0, min(max_images, B, G))
+
+    if num_to_save <= 0:
+        return combined_path, None
+
+    record = {
+        "epoch": epoch + 1,
+        "global_step": global_step + 1,  # 1-based for readability
+        "png_path": combined_path,
+        "images": images[:num_to_save].detach().cpu(),  # (K, C, H, W)
+        "gate_values_full": (
+            gate_values_full[:num_to_save].detach().cpu()
+            if isinstance(gate_values_full, torch.Tensor)
+            else gate_values_full
+        ),
+        "image_size": image_size,
+        "patch_size": patch_size,
+    }
+
+    return combined_path, record
+
+
+# -----------------------------
+# Token similarity / distance matrices & heatmap utilities
+# -----------------------------
+
+def _normalize_to_uint8(
+    mat: np.ndarray,
+    value_range: Optional[tuple[float, float]] = None,
+) -> np.ndarray:
+    """
+    Normalize a float matrix to uint8 [0, 255] for visualization.
+    """
+    mat = np.asarray(mat, dtype=np.float32)
+
+    if mat.size == 0:
+        return np.zeros_like(mat, dtype=np.uint8)
+
+    if value_range is not None:
+        vmin, vmax = value_range
+    else:
+        vmin = float(np.nanmin(mat))
+        vmax = float(np.nanmax(mat))
+
+    # Replace non-finite entries with the minimum
+    mat = np.where(np.isfinite(mat), mat, vmin)
+
+    if vmax <= vmin:
+        return np.zeros_like(mat, dtype=np.uint8)
+
+    mat = (mat - vmin) / (vmax - vmin)
+    mat = np.clip(mat, 0.0, 1.0)
+    return (mat * 255.0).astype(np.uint8)
+
+
+def dot_sim_matrix(tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Simple dot-product similarity between tokens.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) matrix with entry (i, j) = <x_i, x_j>.
+    """
+    return tokens @ tokens.T  # (N, N)
+
+
+def euclidean_dist2_matrix(tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Squared Euclidean distance matrix.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) matrix with ||x_i - x_j||^2.
+    """
+    x = tokens
+    # (N,)
+    sq_norm = (x ** 2).sum(dim=1)
+    # (N, N): ||x_i||^2 + ||x_j||^2 - 2 x_i·x_j
+    dist2 = sq_norm.unsqueeze(1) + sq_norm.unsqueeze(0) - 2 * (x @ x.T)
+    # numerical safety
+    return torch.clamp(dist2, min=0.0)
+
+
+def rbf_kernel_matrix(tokens: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    """
+    RBF / Gaussian kernel similarity based on squared Euclidean distance.
+
+    Args:
+        tokens: (N, D) tensor.
+        sigma:  kernel width.
+
+    Returns:
+        (N, N) matrix with exp(-||x_i - x_j||^2 / (2 * sigma^2)).
+    """
+    dist2 = euclidean_dist2_matrix(tokens)
+    return torch.exp(-dist2 / (2 * sigma ** 2))
+
+
+def token_corr_matrix(tokens: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Pearson correlation matrix over token features.
+
+    Args:
+        tokens: (N, D) tensor.
+        eps:    small constant for numerical stability.
+
+    Returns:
+        (N, N) correlation matrix in [-1, 1].
+    """
+    x = tokens
+    N, D = x.shape
+
+    mu = x.mean(dim=1, keepdim=True)        # (N, 1)
+    x_centered = x - mu                     # (N, D)
+
+    # Use max(D-1, 1) to avoid division by zero when D == 1
+    denom_d = max(D - 1, 1)
+    cov = (x_centered @ x_centered.T) / denom_d   # (N, N)
+    var = cov.diag()                               # (N,)
+
+    std = torch.sqrt(var + eps)                   # (N,)
+    denom = std.unsqueeze(0) * std.unsqueeze(1)   # (N, N)
+
+    corr = cov / (denom + eps)
+    return torch.clamp(corr, -1.0, 1.0)
+
+
+def cosine_sim_matrix(tokens: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Cosine similarity matrix between tokens.
+
+    Args:
+        tokens: (N, D) tensor.
+
+    Returns:
+        (N, N) cosine similarity matrix in [-1, 1].
+    """
+    x = F.normalize(tokens, p=2, dim=-1, eps=eps)  # (N, D), rows unit norm
+    return x @ x.T                                  # (N, N)
+
+
+def compute_token_ssim_matrix(
+    tokens: torch.Tensor,
+    c1: float = 1e-4,
+    c2: float = 9e-4,
+) -> torch.Tensor:
+    """
+    Compute an "SSIM-style" similarity matrix between token vectors.
+
+    Args:
+        tokens: Tensor of shape (N, D), where N is number of tokens and
+                D is embedding dimension (e.g., input to gate MLP).
+        c1, c2: Small constants for numerical stability, analogous to
+                standard SSIM.
+
+    Returns:
+        ssim: Tensor of shape (N, N), where ssim[i, j] is the structural
+              similarity between token i and token j (in embedding space).
+    """
+    # tokens: (N, D)
+    x = tokens  # (N, D)
+    N, D = x.shape
+
+    # Mean per token (over feature dim)
+    mu = x.mean(dim=1, keepdim=True)          # (N, 1)
+    x_centered = x - mu                       # (N, D)
+    var = (x_centered ** 2).mean(dim=1, keepdim=True)  # (N, 1)
+
+    # Covariance between token i and j:
+    # cov[i,j] = E_d[(x_i_d - mu_i)*(x_j_d - mu_j)]
+    cov = (x_centered @ x_centered.T) / D     # (N, N)
+
+    mu_i = mu                                 # (N, 1)
+    mu_j = mu.T                               # (1, N)
+    var_i = var                               # (N, 1)
+    var_j = var.T                             # (1, N)
+
+    num = (2 * mu_i * mu_j + c1) * (2 * cov + c2)
+    den = (mu_i ** 2 + mu_j ** 2 + c1) * (var_i + var_j + c2)
+
+    ssim = num / (den + 1e-12)
+    ssim = torch.clamp(ssim, -1.0, 1.0)
+    return ssim
+
+
+def save_heatmap_from_matrix(
+    matrix: torch.Tensor | np.ndarray,
+    out_path: str,
+    scale: int = 4,
+    value_range: Optional[tuple[float, float]] = None,
+) -> None:
+    """
+    Save a precomputed similarity/distance matrix as a grayscale heatmap,
+    where each cell is rendered as a `scale` x `scale` block.
+
+    Args:
+        matrix:      (N, N) similarity / distance matrix.
+        out_path:    Path to the PNG file.
+        scale:       Integer upscale factor for each cell.
+        value_range: Optional (vmin, vmax) for normalization. If None,
+                     uses matrix min/max.
+    """
+    if isinstance(matrix, torch.Tensor):
+        mat_np = matrix.detach().cpu().numpy().astype(np.float32)
+    else:
+        mat_np = np.asarray(matrix, dtype=np.float32)
+
+    img_arr = _normalize_to_uint8(mat_np, value_range=value_range)
+
+    if scale > 1:
+        img_arr = np.repeat(np.repeat(img_arr, scale, axis=0), scale, axis=1)
+
+    img = Image.fromarray(img_arr, mode="L")
+    img.save(out_path)
+
+
+def save_heatmap(
+    tokens: torch.Tensor,
+    out_path: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    scale: int = 4,
+    value_range: Optional[tuple[float, float]] = None,
+) -> None:
+    """
+    Generic heatmap saver: compute a token-token metric matrix with
+    `metric_fn(tokens)` and save it as a grayscale image.
+
+    By default, uses cosine similarity.
+
+    Args:
+        tokens:     (N, D) token embeddings.
+        out_path:   Path to the PNG file.
+        metric_fn:  Callable mapping (N, D) -> (N, N). Default is
+                    cosine_sim_matrix.
+        scale:      Integer upscale factor for each cell.
+        value_range:Optional (vmin, vmax) for normalization. If None,
+                    uses matrix min/max.
+    """
+    if metric_fn is None:
+        metric_fn = cosine_sim_matrix
+
+    matrix = metric_fn(tokens)
+    save_heatmap_from_matrix(
+        matrix,
+        out_path=out_path,
+        scale=scale,
+        value_range=value_range,
+    )
+
+
+def save_sim_heatmap_grid(
+    tokens_batch: torch.Tensor,
+    out_path: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    scale: int = 4,
+    pad_width: int = 4,
+    pad_value: float = 0.2,
+    max_cols: int = 8,
+    value_range: Optional[tuple[float, float]] = None,
+) -> None:
+    """
+    Save a PNG containing a grid of heatmaps (one per example), using a
+    token-token metric.
+
+    Layout:
+      - up to `max_cols` heatmaps per row
+      - each heatmap has vertical separator bars on left and right
+
+    Args:
+        tokens_batch: (K, N, D) tensor; K examples, N tokens, D dim.
+        out_path:     Where to save the combined PNG.
+        metric_fn:    Callable mapping (N, D) -> (N, N).
+                      Defaults to cosine similarity (cosine_sim_matrix).
+        scale:        Upscaling factor per cell (visual size).
+        pad_width:    Pixel width of vertical separator bars.
+        pad_value:    Grayscale value in [0, 1] for separator bars.
+        max_cols:     Maximum number of heatmaps per row.
+        value_range:  Optional (vmin, vmax) for normalization across ALL
+                      tiles. If None, uses global min/max over all matrices.
+    """
+    tokens_batch = tokens_batch.detach().cpu()
+    K, N, D = tokens_batch.shape
+
+    if K == 0:
+        return  # nothing to save
+
+    if metric_fn is None:
+        # Default: cosine similarity
+        metric_fn = cosine_sim_matrix
+
+    # ---------------------------------------------------------
+    # 1) Compute all metric matrices and gather global min/max
+    # ---------------------------------------------------------
+    matrices: list[np.ndarray] = []
+    global_min = float("inf")
+    global_max = float("-inf")
+
+    for k in range(K):
+        tokens = tokens_batch[k]  # (N, D)
+        mat = metric_fn(tokens)   # (N, N)
+
+        if isinstance(mat, torch.Tensor):
+            mat_np = mat.detach().cpu().numpy().astype(np.float32)
+        else:
+            mat_np = np.asarray(mat, dtype=np.float32)
+
+        matrices.append(mat_np)
+
+        if value_range is None:
+            finite = mat_np[np.isfinite(mat_np)]
+            if finite.size > 0:
+                mmin = float(finite.min())
+                mmax = float(finite.max())
+                global_min = min(global_min, mmin)
+                global_max = max(global_max, mmax)
+
+    # Decide normalization range
+    if value_range is not None:
+        vmin, vmax = value_range
+    else:
+        if not np.isfinite(global_min) or not np.isfinite(global_max) or global_max <= global_min:
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmin, vmax = global_min, global_max
+
+    pad_val_255 = int(np.clip(pad_value, 0.0, 1.0) * 255)
+
+    # ---------------------------------------------------------
+    # 2) Build per-example tiles with vertical separator bars
+    # ---------------------------------------------------------
+    tiles: list[np.ndarray] = []
+    for mat_np in matrices:
+        img_arr = _normalize_to_uint8(mat_np, value_range=(vmin, vmax))
+
+        if scale > 1:
+            img_arr = np.repeat(np.repeat(img_arr, scale, axis=0), scale, axis=1)
+
+        H, W = img_arr.shape
+
+        # Vertical separator bars on left and right
+        pad_col = np.full((H, pad_width), pad_val_255, dtype=np.uint8)
+        tile_with_bars = np.concatenate(
+            [pad_col, img_arr, pad_col],
+            axis=1,
+        )  # (H, W + 2 * pad_width)
+
+        tiles.append(tile_with_bars)
+
+    # ---------------------------------------------------------
+    # 3) Arrange tiles into a grid (rows x cols)
+    # ---------------------------------------------------------
+    num_cols = min(max_cols, K)
+    num_rows = int(math.ceil(K / num_cols))
+
+    row_images: list[np.ndarray] = []
+    for r in range(num_rows):
+        row_tiles = tiles[r * num_cols : (r + 1) * num_cols]
+        if not row_tiles:
+            continue
+        row_img = np.concatenate(row_tiles, axis=1)
+        row_images.append(row_img)
+
+    combined = np.concatenate(row_images, axis=0)  # stack rows vertically
+
+    img = Image.fromarray(combined, mode="L")
+    img.save(out_path)
+
+
+def save_token_sim_debug_step(
+    *,
+    tokens_batch: torch.Tensor,
+    epoch: int,
+    global_step: int,
+    save_root: str,
+    metric_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    logger: Optional[logging.Logger] = None,
+    scale: int = 4,
+    pad_width: int = 4,
+    pad_value: float = 0.2,
+    max_cols: int = 8,
+) -> tuple[str, Optional[dict]]:
+    """
+    Convenience wrapper around `save_sim_heatmap_grid` that:
+      - builds the debug_sim directory & filename
+      - saves the PNG grid
+      - prepares a dict suitable for saving to a .pt file.
+
+    Returns:
+        png_path: PNG path for the token similarity grid.
+        record:   dict with token batch + metadata, or None.
+    """
+    debug_dir = os.path.join(save_root, "debug_sim")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    step_str = f"e{epoch+1:03d}_s{global_step+1:06d}"
+    ssim_png_path = os.path.join(debug_dir, f"{step_str}_token_metric_grid.png")
+
+    # Use cosine_sim_matrix by default if metric_fn is None
+    save_sim_heatmap_grid(
+        tokens_batch,
+        ssim_png_path,
+        metric_fn=metric_fn,
+        scale=scale,
+        pad_width=pad_width,
+        pad_value=pad_value,
+        max_cols=max_cols,
+        value_range=None,
+    )
+
+    if logger is not None:
+        logger.info(
+            "Saved token similarity grid for epoch %d, step %d under %s",
+            epoch + 1,
+            global_step + 1,
+            debug_dir,
+        )
+
+    # tokens_batch is expected to be a Tensor; detach & move to CPU for storage
+    record = {
+        "epoch": epoch + 1,
+        "global_step": global_step + 1,
+        "png_path": ssim_png_path,
+        "tokens_batch": tokens_batch.detach().cpu(),  # (K, N, D)
+    }
+
+    return ssim_png_path, record
+
+
+# -----------------------------
+# Gating statistics helpers
+# -----------------------------
+
+def summarize_open_fraction(open_frac_per_sample: torch.Tensor) -> dict:
+    """
+    Given a tensor of shape (B,) with per-sample expected open fractions,
+    return simple summary stats as Python floats.
+    """
+    if not isinstance(open_frac_per_sample, torch.Tensor):
+        open_frac_per_sample = torch.as_tensor(open_frac_per_sample)
+
+    if open_frac_per_sample.numel() == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+    # Use unbiased=False so std is well-defined even for B == 1
+    mean = open_frac_per_sample.mean().item()
+    std = open_frac_per_sample.std(unbiased=False).item()
+    min_val = open_frac_per_sample.min().item()
+    max_val = open_frac_per_sample.max().item()
+
+    return {
+        "mean": mean,
+        "std": std,
+        "min": min_val,
+        "max": max_val,
+    }
+
+
+def summarize_gate_values(gate_values_full: torch.Tensor) -> dict:
+    """
+    Given a tensor of gate values of shape (B, N) in [0, 1],
+    compute summary stats over all gates in the batch.
+    """
+    if not isinstance(gate_values_full, torch.Tensor):
+        gate_values_full = torch.as_tensor(gate_values_full)
+
+    if gate_values_full.numel() == 0:
+        return {"mean": 0.0, "std": 0.0}
+
+    flat = gate_values_full.view(-1)
+
+    mean = flat.mean().item()
+    std = flat.std(unbiased=False).item()
+
+    return {
+        "mean": mean,
+        "std": std,
+    }
+
+
+# -----------------------------
+# Token statistics helpers
+# -----------------------------
+
+def average_pairwise_cosine(
+    tokens: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Average pairwise cosine similarity between tokens for a single example.
+
+    Args:
+        tokens: (N, D) tensor of token embeddings for ONE sample.
+        eps:    numerical stability constant.
+
+    Returns:
+        scalar tensor: mean_{i != j} cos(x_i, x_j).
+    """
+    # tokens: (N, D)
+    if tokens.ndim != 2:
+        raise ValueError(f"expected tokens to have shape (N, D), got {tokens.shape}")
+
+    N, D = tokens.shape
+    if N <= 1:
+        # No pairs; return 0 as a neutral value
+        return torch.zeros((), device=tokens.device, dtype=tokens.dtype)
+
+    # Normalize per token
+    x = F.normalize(tokens, p=2, dim=-1, eps=eps)  # (N, D)
+    sim = x @ x.T                                  # (N, N), cosine similarities
+
+    # Exclude diagonal (self-similarity)
+    mask = ~torch.eye(N, dtype=torch.bool, device=sim.device)
+    return sim[mask].mean()
+
+
+def average_pairwise_cosine_batch(
+    tokens_batch: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Batch version of average_pairwise_cosine.
+
+    Args:
+        tokens_batch: (K, N, D) tensor; K examples, N tokens, D dim.
+        eps:          numerical stability constant.
+
+    Returns:
+        scalar tensor: average over K samples of their per-sample ACS.
+    """
+    if tokens_batch.ndim != 3:
+        raise ValueError(f"expected tokens_batch to have shape (K, N, D), got {tokens_batch.shape}")
+
+    K, N, D = tokens_batch.shape
+    if K == 0:
+        return torch.zeros((), device=tokens_batch.device, dtype=tokens_batch.dtype)
+
+    vals = []
+    for k in range(K):
+        vals.append(average_pairwise_cosine(tokens_batch[k], eps=eps))
+
+    return torch.stack(vals).mean()
+
+
+def effective_rank(
+    tokens: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Effective rank (erank) of the token matrix for a single example.
+
+    Uses Shannon entropy of the squared singular values:
+
+        erank = exp( H(p) ),  p_i = s_i^2 / sum_j s_j^2
+
+    where s_i are singular values of the centered token matrix.
+
+    Args:
+        tokens: (N, D) tensor of token embeddings for ONE sample.
+        eps:    numerical stability constant.
+
+    Returns:
+        scalar tensor: effective rank (>= 1).
+    """
+    if tokens.ndim != 2:
+        raise ValueError(f"expected tokens to have shape (N, D), got {tokens.shape}")
+
+    # Center across tokens (treat tokens as samples, features along dim=1)
+    x = tokens - tokens.mean(dim=0, keepdim=True)  # (N, D)
+
+    # SVD: x = U S V^T, we only need singular values S
+    # full_matrices=False for efficiency
+    _, S, _ = torch.linalg.svd(x, full_matrices=False)  # S: (min(N, D),)
+
+    # Convert singular values to a probability distribution over energy
+    energy = S ** 2
+    energy_sum = energy.sum()
+    energy = energy / (energy_sum + eps)
+
+    # Shannon entropy of spectrum (base e)
+    H = -(energy * (energy + eps).log()).sum()
+
+    erank = torch.exp(H)
+    return erank
+
+
+def effective_rank_batch(
+    tokens_batch: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Batch version of effective_rank.
+
+    Args:
+        tokens_batch: (K, N, D) tensor of token embeddings.
+        eps:          numerical stability constant.
+
+    Returns:
+        scalar tensor: average effective rank across the K samples.
+    """
+    if tokens_batch.ndim != 3:
+        raise ValueError(f"expected tokens_batch to have shape (K, N, D), got {tokens_batch.shape}")
+
+    K, N, D = tokens_batch.shape
+    if K == 0:
+        return torch.zeros((), device=tokens_batch.device, dtype=tokens_batch.dtype)
+
+    vals = []
+    for k in range(K):
+        vals.append(effective_rank(tokens_batch[k], eps=eps))
+
+    return torch.stack(vals).mean()

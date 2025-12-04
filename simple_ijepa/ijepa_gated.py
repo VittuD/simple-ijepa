@@ -17,110 +17,6 @@ class GatedIJEPA(BaseIJEPA):
     Gated variant of I-JEPA where the student encoder decides which tokens to
     use as visible context and which to mask, via differentiable hard-concrete
     gates.
-
-    High-level idea
-    ---------------
-    For an image x, we compute:
-
-      * Teacher / target encoder (EMA of the student):
-
-          z^{(T)} = h_ξ(x) ∈ R^{N×D}
-
-      * Student / context encoder:
-
-          z^{(S)} = h_θ(x) ∈ R^{N×D}
-
-      * Gating network on (intermediate or final) student tokens:
-
-          log α = g_ϕ(z^{(S)}) ∈ R^{N}
-          r ~ HardConcrete(log α) ∈ [0, 1]^N
-
-        Each gate r_i is interpreted as:
-          r_i ≈ 1   -> token i is "open" (visible context)
-          r_i ≈ 0   -> token i is "closed" (masked, to be predicted)
-
-      * Masked tokens:
-
-          c_i = r_i · z^{(S)}_i + (1 - r_i) · m
-
-        where m ∈ R^D is a learned mask token shared across positions.
-
-        Depending on where gating is applied:
-
-          - If done "at the end" (gate_layer_index is None), c_i is built
-            from the final encoder tokens and only affects the predictor input.
-
-          - If done after an earlier transformer block, c_i replaces the
-            tokens that feed into subsequent transformer blocks, so later
-            layers operate on a masked sequence.
-
-    Loss
-    ----
-    The prediction loss is an MSE over *all* tokens (gates only affect the
-    predictor input / intermediate states, not which tokens are evaluated):
-
-        L_pred = mean_{b,i} || LN(ẑ_{b,i}) - LN(z^{(T)}_{b,i}) ||².
-
-    We add a gate-usage penalty that grows exponentially with the *fraction*
-    of expected open gates per sample.
-
-    For a batch of size B with tokens i = 1..N, define:
-
-        π_{b,i} = P(r_{b,i} > 0)           (open probability from the gate)
-        f_b     = (1 / N) ∑_i π_{b,i}      (expected open fraction per sample)
-
-        p_b     = exp(α · f_b) - 1
-
-    Then:
-
-        L_gates = (1 / B) ∑_b p_b
-        L_total = L_pred + λ_gates · L_gates.
-
-    Gating location
-    ---------------
-    Two knobs:
-
-      * gate_layer_index ∈ {0, …, depth-1} or None
-
-          - None: gating is applied on the final encoder tokens, *outside*
-            the transformer. The encoder always sees the full unmasked image,
-            only the predictor sees masked tokens.
-
-          - k: we run the context encoder block-by-block. At block k we
-            apply gating, and the remaining blocks see masked tokens.
-
-      * gate_inside_block ∈ {False, True}
-
-          - False (default):
-               gate MLP is applied to the *output* of the entire block:
-                   x ← Attn(x) + x
-                   x ← FFN(x) + x
-                   [gate here on x]
-
-          - True:
-               gate MLP is applied *inside* the block, after attention but
-               before the residual connection and FFN:
-                   y = Attn(x)
-                   [gate here on y]
-                   x ← y_gated + x
-                   x ← FFN(x) + x
-
-        This allows you to force the model to decide what to keep/drop earlier
-        in the computation, before representations fully oversmooth.
-
-    Observability
-    -------------
-    The forward pass additionally returns a dictionary of statistics:
-
-      * "pred_loss":              L_pred (scalar)
-      * "gate_penalty":           L_gates (scalar, before λ_gates)
-      * "open_prob_mean":         E_{b,i}[π_{b,i}]
-      * "closed_prob_mean":       1 - open_prob_mean
-      * "open_frac_per_sample":   f_b  (shape: B)
-      * "closed_frac_per_sample": 1 - f_b
-      * "gate_map_example":       example gate map r_{b,i} reshaped to
-                                  (H_p, W_p), where H_p = W_p = img_size / patch_size
-      * "gate_values_full":       full gate values r_{b,i}, shape (B, N)
     """
 
     def __init__(
@@ -140,6 +36,7 @@ class GatedIJEPA(BaseIJEPA):
         gate_location: str = "post",
     ) -> None:
         # Set up context/target encoders and EMA utilities
+        # NOTE: BaseIJEPA.__init__ only expects `encoder`.
         super().__init__(encoder=encoder)
 
         self.patch_size = patch_size
@@ -191,7 +88,6 @@ class GatedIJEPA(BaseIJEPA):
             zeta=gate_zeta,
         )
 
-
     def _encode_student_with_internal_gating(
         self,
         img: torch.Tensor,
@@ -200,35 +96,6 @@ class GatedIJEPA(BaseIJEPA):
         Run the context encoder block-by-block, applying gating at a given
         transformer block index (self.gate_layer_index). The remaining blocks
         see masked tokens.
-
-        gate_location controls *where* in the block we gate:
-
-          - "attn":
-              y = Attn(x)
-              [gate on y]
-              x = y_gated + x
-              x = FFN(x) + x
-
-          - "skip":
-              y = Attn(x)
-              x_skip = y + x
-              [gate on x_skip]
-              x = x_gated
-              x = FFN(x) + x
-
-          - "post":
-              x = Attn(x) + x
-              x = FFN(x) + x
-              [gate on x]
-
-        Returns:
-            student_tokens:         (B, N, D) final normalized tokens after all blocks
-                                    (already influenced by gating).
-            gate_values:            (B, N) sampled gate values in [0, 1]
-            gate_probs:             (B, N) open probabilities π_{b,i}
-            "gate_mlp_input_examples": (K, N, D) tokens fed to gate_mlp for
-                                    the first K samples in the batch
-                                    (K ≤ 8, used for SSIM observability).
         """
         vt = self.context_encoder
         device = img.device
@@ -335,7 +202,6 @@ class GatedIJEPA(BaseIJEPA):
 
         return x, gate_values, gate_probs, gate_mlp_input_examples
 
-
     def forward(
         self,
         img: torch.Tensor,
@@ -350,16 +216,7 @@ class GatedIJEPA(BaseIJEPA):
             total_loss: scalar tensor, the gated I-JEPA loss:
                         L_total = L_pred + λ_gates · L_gates
 
-            stats: dict with monitoring information, containing:
-                * "pred_loss"
-                * "gate_penalty"
-                * "open_prob_mean"
-                * "closed_prob_mean"
-                * "open_frac_per_sample"
-                * "closed_frac_per_sample"
-                * "gate_map_example"
-                * "gate_values_full"
-                * "gate_mlp_input_example"  # (N, D) tokens fed to gate_mlp
+            stats: dict with monitoring information.
         """
         device = img.device
 
@@ -474,4 +331,3 @@ class GatedIJEPA(BaseIJEPA):
         }
 
         return total_loss, stats
-

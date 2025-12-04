@@ -20,12 +20,37 @@ class DataConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    """
+    Generic scheduler config used for learning rate (and to derive a
+    matching schedule for weight decay).
+
+    name: one of ["constant", "linear", "cosine", "step"]
+    """
+    name: str = "constant"
+    num_warmup_steps: int = 0
+    num_cycles: float = 0.5      # used by cosine
+    num_steps: int = 0           # used by step
+    gamma: float = 0.1           # used by step
+
+
+@dataclass
 class OptimConfig:
     # optimization / training loop
     num_epochs: int = 100
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
     fp16_precision: bool = True
+
+    # LR / WD scheduling (Hydra-configurable)
+    #
+    # - lr_scheduler controls the LR schedule via training.schedulers.get_scheduler
+    # - weight decay is tied to the same schedule by default:
+    #       weight_decay(t) = weight_decay_0 * lr_scale(t)
+    #
+    # With the default "constant" scheduler and 0 warmup, this exactly
+    # matches the current behavior (constant LR and WD).
+    lr_scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 @dataclass
@@ -65,6 +90,7 @@ class LoggingConfig:
 
     # Path to a text file that contains the W&B API key (single line).
     wandb_api_key_file: Optional[str] = ".secrets"
+
 
 @dataclass
 class DebugConfig:

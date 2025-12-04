@@ -1,7 +1,7 @@
 # simple_ijepa/simple_ijepa/training/ddp_trainer.py
 
 import os
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 from torchvision.datasets import STL10
+from torch.optim.lr_scheduler import LambdaLR
 
 from simple_ijepa.transformer import VisionTransformer
 from simple_ijepa.ijepa import IJEPA
@@ -40,6 +41,7 @@ from simple_ijepa.training.dist_utils import (
     setup_logging,
 )
 from simple_ijepa.training.schedulers import get_scheduler
+from simple_ijepa.model_card import build_model_card
 
 
 SEED = 42
@@ -49,6 +51,9 @@ class IJEPATrainerDDP:
     def __init__(self, cfg: TrainConfig):
         self.cfg = prepare_paths(cfg)
 
+    # ------------------------------------------------------------------
+    # Model / optimizer / data builders
+    # ------------------------------------------------------------------
     def _build_model_and_optimizer(
         self,
         device: torch.device,
@@ -57,9 +62,8 @@ class IJEPATrainerDDP:
         model_cfg: IJEPAConfig,
         logger,
     ) -> Tuple[torch.nn.Module, torch.optim.Optimizer, str, str]:
-        """
-        Build the encoder + IJEPA or GatedIJEPA model, load an optional checkpoint,
-        and create the optimizer.
+        """Build the encoder + IJEPA or GatedIJEPA model, load an optional
+        checkpoint, and create the optimizer.
 
         Returns:
             model (on correct device),
@@ -154,9 +158,7 @@ class IJEPATrainerDDP:
         world_size: int,
         rank: int,
     ) -> Tuple[DataLoader, DistributedSampler]:
-        """
-        Create STL10-based training dataset and DDP-aware DataLoader.
-        """
+        """Create STL10-based training dataset and DDP-aware DataLoader."""
         cfg = self.cfg
         if cfg.data.dataset_name != "stl10":
             raise ValueError("Only STL10 is supported in this implementation.")
@@ -206,6 +208,9 @@ class IJEPATrainerDDP:
         train_loader = DataLoader(**loader_kwargs)
         return train_loader, train_sampler
 
+    # ------------------------------------------------------------------
+    # Forward wrapper
+    # ------------------------------------------------------------------
     def _forward_batch(
         self,
         ddp_model: DDP,
@@ -213,10 +218,7 @@ class IJEPATrainerDDP:
         device: torch.device,
         fp16: bool,
     ):
-        """
-        Run a forward pass for a batch, handling the differences between
-        baseline and gated variants. Returns (loss, stats, images).
-        """
+        """Run a forward pass for a batch and return (loss, stats, images)."""
         cfg = self.cfg
         if cfg.variant == "baseline":
             images, context_indices, target_indices_list = batch
@@ -234,6 +236,141 @@ class IJEPATrainerDDP:
 
         return loss, stats, images
 
+    # ------------------------------------------------------------------
+    # Logging helpers (per-step)
+    # ------------------------------------------------------------------
+    def _build_gating_metrics(
+        self,
+        stats: Dict[str, Any],
+        model_cfg: IJEPAConfig,
+    ) -> Dict[str, float]:
+        """Build the gating-related metrics dict from the stats returned
+        by GatedIJEPA."""
+        pred_loss = stats["pred_loss"].item()
+        gate_penalty = stats["gate_penalty"].item()
+        open_prob_mean = stats["open_prob_mean"].item()
+        closed_prob_mean = stats["closed_prob_mean"].item()
+
+        metrics: Dict[str, float] = {
+            "gates/pred_loss": pred_loss,
+            "gates/gate_penalty": gate_penalty,
+            "gates/open_prob_mean": open_prob_mean,
+            "gates/closed_prob_mean": closed_prob_mean,
+        }
+
+        # Extra summaries over per-sample fractions and per-gate values
+        open_frac_stats = {}
+        gate_value_stats = {}
+
+        open_frac_tensor = stats.get("open_frac_per_sample")
+        gate_values_full = stats.get("gate_values_full")
+
+        if isinstance(open_frac_tensor, torch.Tensor):
+            open_frac_stats = summarize_open_fraction(open_frac_tensor)
+
+        if isinstance(gate_values_full, torch.Tensor):
+            gate_value_stats = summarize_gate_values(gate_values_full)
+
+        if open_frac_stats:
+            metrics.update(
+                {
+                    "gates/open_frac_mean": open_frac_stats["mean"],
+                    "gates/open_frac_std": open_frac_stats["std"],
+                    "gates/open_frac_min": open_frac_stats["min"],
+                    "gates/open_frac_max": open_frac_stats["max"],
+                }
+            )
+
+        if gate_value_stats:
+            metrics.update(
+                {
+                    "gates/gate_value_mean": gate_value_stats["mean"],
+                    "gates/gate_value_std": gate_value_stats["std"],
+                }
+            )
+
+        return metrics
+
+    def _build_step_desc_and_metrics(
+        self,
+        *,
+        epoch: int,
+        num_epochs: int,
+        global_step: int,
+        loss_value: float,
+        epoch_loss_avg: float,
+        total_loss_avg: float,
+        gamma: float,
+        optimizer: torch.optim.Optimizer,
+        grad_norm: float,
+        param_norm: float,
+        stats: Dict[str, Any] | None,
+        model_cfg: IJEPAConfig,
+    ) -> Tuple[str, Dict[str, float]]:
+        """Build the progress-bar description and metrics dict for the step."""
+        cfg = self.cfg
+        current_lr = optimizer.param_groups[0]["lr"]
+        current_weight_decay = optimizer.param_groups[0].get("weight_decay", 0.0)
+
+        base_metrics: Dict[str, float] = {
+            # Training progress
+            "train/epoch": float(epoch + 1),
+            "train/global_step": float(global_step + 1),
+            "train/loss_step": float(loss_value),
+            "train/loss_epoch": float(epoch_loss_avg),
+            "train/loss_avg": float(total_loss_avg),
+            # Optimization-related
+            "optim/ema_gamma": float(gamma),
+            "optim/lr": float(current_lr),
+            "optim/grad_norm_global": float(grad_norm),
+            "optim/param_norm_global": float(param_norm),
+            "optim/weight_decay": float(current_weight_decay),
+        }
+
+        # Baseline variant: no gating
+        if cfg.variant == "baseline":
+            desc = (
+                f"Epoch {epoch+1}/{num_epochs} | "
+                f"Step {global_step+1} | "
+                f"Epoch Loss: {epoch_loss_avg:.7f} | "
+                f"Total Loss: {total_loss_avg:.7f} | "
+                f"EMA γ: {gamma:.6f} | "
+                f"Lr: {current_lr:.6f} | "
+                f"gN: {grad_norm:.2e} | "
+                f"pN: {param_norm:.2e}"
+            )
+            return desc, base_metrics
+
+        # Gated variant: add gate-specific metrics
+        assert stats is not None, "Gated variant expects non-None stats."
+
+        gating_metrics = self._build_gating_metrics(stats, model_cfg=model_cfg)
+        metrics = {**base_metrics, **gating_metrics}
+
+        pred_loss = stats["pred_loss"].item()
+        gate_penalty = stats["gate_penalty"].item()
+        open_prob_mean = stats["open_prob_mean"].item()
+        closed_prob_mean = stats["closed_prob_mean"].item()
+
+        desc = (
+            f"Epoch {epoch+1}/{num_epochs} | "
+            f"Step {global_step+1} | "
+            f"EpLoss: {epoch_loss_avg:.4f} | "
+            f"TotLoss: {total_loss_avg:.4f} | "
+            f"Pred: {pred_loss:.4f} | "
+            f"GatePen: {gate_penalty:.3f} | "
+            f"Open: {open_prob_mean*100:.1f}% | "
+            f"Closed: {closed_prob_mean*100:.1f}% | "
+            f"EMA γ: {gamma:.4f} | "
+            f"Lr: {current_lr:.6f} | "
+            f"gN: {grad_norm:.2e} | "
+            f"pN: {param_norm:.2e}"
+        )
+        return desc, metrics
+
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
     def train(self) -> None:
         cfg = self.cfg
 
@@ -289,14 +426,32 @@ class IJEPATrainerDDP:
             else None
         )
 
+        # --- EMA scheduler (unchanged, but uses factory) ---
         total_num_steps = (len(train_loader) * (cfg.optim.num_epochs + 2)) - cfg.ema.update_gamma_after_step
-
-        # EMA gamma cosine schedule from cfg.ema.gamma -> 1.0
         ema_scheduler = get_scheduler(
             name="ema_cosine",
             num_training_steps=total_num_steps,
             ema_base_gamma=cfg.ema.gamma,
         )
+
+        # --- LR + WD scheduler (Hydra-configurable) ---
+        num_training_steps_lr = len(train_loader) * cfg.optim.num_epochs
+        lr_sched_cfg = cfg.optim.lr_scheduler
+
+        lr_scheduler: LambdaLR = get_scheduler(
+            name=lr_sched_cfg.name,
+            optimizer=optimizer,
+            num_warmup_steps=lr_sched_cfg.num_warmup_steps,
+            num_training_steps=num_training_steps_lr,
+            num_steps=(lr_sched_cfg.num_steps if lr_sched_cfg.name == "step" else None),
+            gamma=(lr_sched_cfg.gamma if lr_sched_cfg.name == "step" else None),
+            num_cycles=lr_sched_cfg.num_cycles,
+        )  # type: ignore[assignment]
+
+        # Base LR/WD used to derive schedules
+        # (we assume a single scalar LR/WD across param groups for now)
+        base_lr = optimizer.param_groups[0]["lr"]
+        base_weight_decay = optimizer.param_groups[0].get("weight_decay", 0.0)
 
         gamma = cfg.ema.gamma
         global_step = 0
@@ -320,6 +475,16 @@ class IJEPATrainerDDP:
                 )
                 logger.info("  gate_layer_index = %s", model_cfg.gate_layer_index)
                 logger.info("  gate_location = %s", model_cfg.gate_location)
+
+            # HF-ish: log a small markdown model card to stdout and (optionally) W&B
+            model_card_md = build_model_card(cfg, world_size=world_size)
+            logger.info("Model card (markdown):\n%s", model_card_md)
+            if wandb_run is not None:
+                try:
+                    # Store in run summary for convenience
+                    wandb_run.summary["model_card"] = model_card_md
+                except Exception:
+                    logger.warning("Failed to attach model card to W&B run.", exc_info=False)
 
         # ----------------------------
         # Training loop
@@ -375,6 +540,19 @@ class IJEPATrainerDDP:
                 scaler.step(optimizer)
                 scaler.update()
 
+                # Step LR scheduler (Hydra-configured)
+                lr_scheduler.step()
+
+                # Derive WD schedule from LR schedule
+                if base_lr > 0.0:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    lr_scale = float(current_lr) / float(base_lr)
+                else:
+                    lr_scale = 1.0
+
+                for group in optimizer.param_groups:
+                    group["weight_decay"] = float(base_weight_decay) * lr_scale
+
                 # EMA update
                 if (
                     global_step > cfg.ema.update_gamma_after_step
@@ -396,107 +574,21 @@ class IJEPATrainerDDP:
                 ep_loss = epoch_loss / (step + 1)
 
                 if rank == 0:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    current_weight_decay = optimizer.param_groups[0].get("weight_decay", 0.0)
-
-                    if cfg.variant == "baseline":
-                        desc = (
-                            f"Epoch {epoch+1}/{cfg.optim.num_epochs} | "
-                            f"Step {global_step+1} | "
-                            f"Epoch Loss: {ep_loss:.7f} | "
-                            f"Total Loss: {avg_loss:.7f} | "
-                            f"EMA γ: {gamma:.6f} | "
-                            f"Lr: {current_lr:.6f} | "
-                            f"gN: {grad_norm:.2e} | "
-                            f"pN: {param_norm:.2e}"
-                        )
-
-                        metrics = {
-                            # Training progress
-                            "train/epoch": epoch + 1,
-                            "train/global_step": global_step + 1,
-                            "train/loss_step": loss_value,
-                            "train/loss_epoch": ep_loss,
-                            "train/loss_avg": avg_loss,
-                            # Optimization-related
-                            "optim/ema_gamma": gamma,
-                            "optim/lr": current_lr,
-                            "optim/grad_norm_global": grad_norm,
-                            "optim/param_norm_global": param_norm,
-                            "optim/weight_decay": current_weight_decay,
-                        }
-                    else:
-                        pred_loss = stats["pred_loss"].item()
-                        gate_penalty = stats["gate_penalty"].item()
-                        open_prob_mean = stats["open_prob_mean"].item()
-                        closed_prob_mean = stats["closed_prob_mean"].item()
-
-                        # Extra gated stats
-                        open_frac_stats = {}
-                        gate_value_stats = {}
-                        if isinstance(stats, dict):
-                            open_frac_tensor = stats.get("open_frac_per_sample")
-                            gate_values_full = stats.get("gate_values_full")
-
-                            if isinstance(open_frac_tensor, torch.Tensor):
-                                open_frac_stats = summarize_open_fraction(open_frac_tensor)
-
-                            if isinstance(gate_values_full, torch.Tensor):
-                                gate_value_stats = summarize_gate_values(gate_values_full)
-
-                        desc = (
-                            f"Epoch {epoch+1}/{cfg.optim.num_epochs} | "
-                            f"Step {global_step+1} | "
-                            f"EpLoss: {ep_loss:.4f} | "
-                            f"TotLoss: {avg_loss:.4f} | "
-                            f"Pred: {pred_loss:.4f} | "
-                            f"GatePen: {gate_penalty:.3f} | "
-                            f"Open: {open_prob_mean*100:.1f}% | "
-                            f"Closed: {closed_prob_mean*100:.1f}% | "
-                            f"EMA γ: {gamma:.4f} | "
-                            f"Lr: {current_lr:.6f} | "
-                            f"gN: {grad_norm:.2e} | "
-                            f"pN: {param_norm:.2e}"
-                        )
-
-                        metrics = {
-                            # Training progress
-                            "train/epoch": epoch + 1,
-                            "train/global_step": global_step + 1,
-                            "train/loss_step": loss_value,
-                            "train/loss_epoch": ep_loss,
-                            "train/loss_avg": avg_loss,
-                            # Optimization-related
-                            "optim/ema_gamma": gamma,
-                            "optim/lr": current_lr,
-                            "optim/grad_norm_global": grad_norm,
-                            "optim/param_norm_global": param_norm,
-                            "optim/weight_decay": current_weight_decay,
-                            # Gating metrics (existing)
-                            "gates/pred_loss": pred_loss,
-                            "gates/gate_penalty": gate_penalty,
-                            "gates/open_prob_mean": open_prob_mean,
-                            "gates/closed_prob_mean": closed_prob_mean,
-                        }
-
-                        # Add new gated summaries under gates/*
-                        if open_frac_stats:
-                            metrics.update(
-                                {
-                                    "gates/open_frac_mean": open_frac_stats["mean"],
-                                    "gates/open_frac_std": open_frac_stats["std"],
-                                    "gates/open_frac_min": open_frac_stats["min"],
-                                    "gates/open_frac_max": open_frac_stats["max"],
-                                }
-                            )
-
-                        if gate_value_stats:
-                            metrics.update(
-                                {
-                                    "gates/gate_value_mean": gate_value_stats["mean"],
-                                    "gates/gate_value_std": gate_value_stats["std"],
-                                }
-                            )
+                    # Build description + metrics in a unified way
+                    desc, metrics = self._build_step_desc_and_metrics(
+                        epoch=epoch,
+                        num_epochs=cfg.optim.num_epochs,
+                        global_step=global_step,
+                        loss_value=loss_value,
+                        epoch_loss_avg=ep_loss,
+                        total_loss_avg=avg_loss,
+                        gamma=gamma,
+                        optimizer=optimizer,
+                        grad_norm=grad_norm,
+                        param_norm=param_norm,
+                        stats=stats,
+                        model_cfg=model_cfg,
+                    )
 
                     # Show progress in-place on console
                     progress_bar.set_description(desc)

@@ -10,7 +10,7 @@ import torch
 
 from omegaconf import OmegaConf
 
-from simple_ijepa.utils import (
+from simple_ijepa.debug_utils import (
     save_mask_debug_step,
     save_token_sim_debug_step,
     append_debug_record,

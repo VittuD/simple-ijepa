@@ -29,17 +29,23 @@ def logistic_regression(
     step: Optional[int] = None,
     prefix: str = "eval",
 ):
+    """
+    Simple STL-10 linear probe: LogisticRegression + CalibratedClassifierCV.
+
+    This is intentionally minimal; see docs/training.md for the full
+    evaluation protocol and hyperparameters.
+    """
     X_train, X_test = embeddings, embeddings_val
     y_train, y_test = labels, labels_val
 
     clf = LogisticRegression(
         max_iter=100,
-        n_jobs=-1,      # use all available threads
-        solver="lbfgs", # default; included here just to be explicit
+        n_jobs=-1,
+        solver="lbfgs",
     )
     clf = CalibratedClassifierCV(
         clf,
-        n_jobs=-1,      # parallelize CV calibration
+        n_jobs=-1,
     )
 
     clf.fit(X_train, y_train)
@@ -52,7 +58,6 @@ def logistic_regression(
     acc = accuracy_score(y_test, y_pred)
     logger.info("Accuracy STL10 (%s): %.4f", prefix, acc)
 
-    # Optional W&B logging
     if wandb_run is not None:
         try:
             wandb_run.log({f"{prefix}/accuracy": acc}, step=step)
@@ -62,6 +67,15 @@ def logistic_regression(
 
 
 class STL10Eval:
+    """
+    Convenience wrapper that:
+      - builds STL-10 train/test loaders,
+      - extracts frozen encoder features,
+      - runs a linear probe via logistic_regression().
+
+    Used periodically during training. See docs/training.md for details.
+    """
+
     def __init__(
         self,
         image_size: int = 96,
@@ -95,7 +109,6 @@ class STL10Eval:
     @torch.inference_mode
     def evaluate(self, ijepa_model, global_step: Optional[int] = None, prefix: str = "eval"):
         model = ijepa_model.target_encoder
-        # model = ijepa_model.context_encoder
         embeddings, labels = self._get_image_embs_labels(
             model, self.train_loader
         )

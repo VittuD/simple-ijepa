@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from simple_ijepa.config import TrainConfig
 from simple_ijepa.stl10_eval import STL10Eval
-from simple_ijepa.utils import GatedPredictorEncoder
+from simple_ijepa.debug_utils import GatedPredictorEncoder
 from simple_ijepa.training.wandb_utils import make_timed_run_slug
 
 
